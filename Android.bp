@@ -1,0 +1,10 @@
+android_app {
+    name: "mdm-client",
+    srcs: ["src/**/*.java"],
+    certificate: "platform",
+    privileged: true,
+    platform_apis: true,
+    dex_preopt: {
+        enabled: false,
+    },
+}
