@@ -5,6 +5,8 @@ import android.content.*;
 import android.net.*;
 import android.net.wifi.*;
 import android.os.*;
+import android.os.Environment;
+import android.os.StatFs;
 import android.util.Log;
 import org.json.JSONException;
 import org.json.JSONObject;
@@ -25,7 +27,7 @@ public class MdmService extends Service {
         @Override
         public void run() {
             if (networkAvailable && !polling) {
-                performPoll();
+                performCheckin();
             }
             mainHandler.postDelayed(this, apiService.getPollInterval());
         }
@@ -44,12 +46,10 @@ public class MdmService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        if (!polling) {
-            new Thread(() -> {
-                apiService.loadRemoteConfig();
-                mainHandler.post(pollRunnable);
-            }).start();
-        }
+        new Thread(() -> {
+            apiService.loadRemoteConfig();
+            mainHandler.post(pollRunnable);
+        }).start();
         return START_STICKY;
     }
 
@@ -78,42 +78,37 @@ public class MdmService extends Service {
         networkAvailable = caps != null && caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET);
     }
 
-    private void performPoll() {
+    private void performCheckin() {
         polling = true;
         new Thread(() -> {
             try {
-                JSONObject deviceData = collectDeviceData();
-                apiService.reportDeviceData(deviceData);
+                JSONObject payload = buildCheckinPayload();
+                apiService.checkin(payload);
             } catch (Exception e) {
-                Log.e(TAG, "Poll failed: " + e.getMessage());
+                Log.e(TAG, "Checkin error: " + e.getMessage());
             } finally {
                 polling = false;
             }
         }).start();
     }
 
-    private JSONObject collectDeviceData() throws JSONException {
-        JSONObject data = new JSONObject();
+    private JSONObject buildCheckinPayload() throws JSONException {
+        JSONObject payload = new JSONObject();
 
-        // Device identity
-        data.put("serial", getDeviceSerial());
-        data.put("build_id", SystemPropertiesProxy.get("ro.build.id", Build.ID));
-        data.put("android_version", Build.VERSION.RELEASE);
-        data.put("sdk_int", Build.VERSION.SDK_INT);
-        data.put("manufacturer", Build.MANUFACTURER);
-        data.put("model", Build.MODEL);
+        // Required fields
+        payload.put("serial_number", getDeviceSerial());
+        payload.put("build_id", Build.DISPLAY);
+        payload.put("battery_pct", getBatteryPct());
 
-        // Battery
-        data.put("battery", getBatteryData());
+        // Extra fields
+        JSONObject extra = new JSONObject();
+        extra.put("ip_address", getWifiIpAddress());
+        extra.put("wifi_ssid", getWifiSsid());
+        extra.put("storage_free_gb", getStorageFreeGb());
+        extra.put("uptime_seconds", SystemClock.elapsedRealtime() / 1000);
+        payload.put("extra", extra);
 
-        // WiFi
-        data.put("wifi", getWifiData());
-
-        // System
-        data.put("uptime_ms", SystemClock.elapsedRealtime());
-        data.put("timestamp", System.currentTimeMillis());
-
-        return data;
+        return payload;
     }
 
     private String getDeviceSerial() {
@@ -124,34 +119,38 @@ public class MdmService extends Service {
         }
     }
 
-    private JSONObject getBatteryData() throws JSONException {
-        JSONObject battery = new JSONObject();
-        BatteryManager bm = (BatteryManager) getSystemService(Context.BATTERY_SERVICE);
-        if (bm != null) {
-            battery.put("level", bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY));
-            battery.put("charging", bm.isCharging());
-            battery.put("status", bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_STATUS));
-            battery.put("current_ua", bm.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW));
-        }
-        return battery;
+    private int getBatteryPct() {
+        IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+        Intent batteryStatus = registerReceiver(null, ifilter);
+        if (batteryStatus == null) return -1;
+        int level = batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+        int scale = batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+        if (level < 0 || scale <= 0) return -1;
+        return (int) ((level / (float) scale) * 100);
     }
 
-    private JSONObject getWifiData() throws JSONException {
-        JSONObject wifi = new JSONObject();
+    private String getWifiIpAddress() {
         WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        if (wm != null && wm.isWifiEnabled()) {
-            WifiInfo info = wm.getConnectionInfo();
-            if (info != null) {
-                wifi.put("ssid", info.getSSID());
-                wifi.put("bssid", info.getBSSID());
-                wifi.put("rssi", info.getRssi());
-                wifi.put("link_speed_mbps", info.getLinkSpeed());
-                int ip4 = info.getIpAddress();
-                wifi.put("ip", String.format("%d.%d.%d.%d",
-                        ip4 & 0xff, (ip4 >> 8) & 0xff, (ip4 >> 16) & 0xff, (ip4 >> 24) & 0xff));
-            }
-        }
-        return wifi;
+        if (wm == null || !wm.isWifiEnabled()) return null;
+        WifiInfo info = wm.getConnectionInfo();
+        if (info == null) return null;
+        int ip4 = info.getIpAddress();
+        return String.format("%d.%d.%d.%d",
+                ip4 & 0xff, (ip4 >> 8) & 0xff, (ip4 >> 16) & 0xff, (ip4 >> 24) & 0xff);
+    }
+
+    private String getWifiSsid() {
+        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+        if (wm == null || !wm.isWifiEnabled()) return null;
+        WifiInfo info = wm.getConnectionInfo();
+        return info != null ? info.getSSID() : null;
+    }
+
+    private double getStorageFreeGb() {
+        StatFs stat = new StatFs(Environment.getDataDirectory().getPath());
+        long bytesAvailable = stat.getAvailableBlocksLong() * stat.getBlockSizeLong();
+        double gb = bytesAvailable / (1024.0 * 1024.0 * 1024.0);
+        return Math.round(gb * 10.0) / 10.0;
     }
 
     private void createNotificationChannel() {

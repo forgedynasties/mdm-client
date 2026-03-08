@@ -1,0 +1,4 @@
+{
+  "api_base_url": "http://10.32.0.61:8080",
+  "poll_interval_ms": 60000
+}
