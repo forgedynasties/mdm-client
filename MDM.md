@@ -323,6 +323,160 @@ curl http://localhost:8080/api/v1/devices/ABC123XYZ \
 
 ---
 
+## Groups API
+
+Groups allow you to target commands at a named set of devices.
+
+All group endpoints require `X-API-Key`.
+
+### POST /api/v1/groups — Create group
+
+```bash
+curl -X POST http://localhost:8080/api/v1/groups \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-key-here" \
+  -d '{"name": "warehouse"}'
+# {"id":"<uuid>","name":"warehouse","device_count":0,"created_at":"..."}
+```
+
+### GET /api/v1/groups — List groups
+
+```bash
+curl http://localhost:8080/api/v1/groups \
+  -H "X-API-Key: your-secret-key-here"
+```
+
+### GET /api/v1/groups/{id} — Group detail + members
+
+```bash
+curl http://localhost:8080/api/v1/groups/<uuid> \
+  -H "X-API-Key: your-secret-key-here"
+```
+
+### POST /api/v1/groups/{id}/devices — Add device to group
+
+```bash
+curl -X POST http://localhost:8080/api/v1/groups/<uuid>/devices \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-key-here" \
+  -d '{"serial_number": "CE061715U9"}'
+```
+
+### DELETE /api/v1/groups/{id}/devices/{serial} — Remove device from group
+
+```bash
+curl -X DELETE http://localhost:8080/api/v1/groups/<uuid>/devices/CE061715U9 \
+  -H "X-API-Key: your-secret-key-here"
+```
+
+### DELETE /api/v1/groups/{id} — Delete group
+
+```bash
+curl -X DELETE http://localhost:8080/api/v1/groups/<uuid> \
+  -H "X-API-Key: your-secret-key-here"
+```
+
+---
+
+## Commands API
+
+Commands instruct devices to install an APK. The server queues the command; each
+device receives it on its next checkin and the response body includes the pending
+commands. The device then acks with the result.
+
+### POST /api/v1/commands — Create command
+
+**Target all devices:**
+```bash
+curl -X POST http://localhost:8080/api/v1/commands \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-key-here" \
+  -d '{
+    "apk_url": "https://example.com/app-v2.apk",
+    "target_type": "all"
+  }'
+```
+
+**Target specific devices:**
+```bash
+curl -X POST http://localhost:8080/api/v1/commands \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-key-here" \
+  -d '{
+    "apk_url": "https://example.com/app-v2.apk",
+    "target_type": "devices",
+    "targets": ["CE061715U9", "CE061715U8"]
+  }'
+```
+
+**Target specific groups:**
+```bash
+curl -X POST http://localhost:8080/api/v1/commands \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-key-here" \
+  -d '{
+    "apk_url": "https://example.com/app-v2.apk",
+    "target_type": "groups",
+    "targets": ["<group-uuid>", "<group-uuid-2>"]
+  }'
+```
+
+**Response (201 Created):**
+```json
+{
+  "id": "<command-uuid>",
+  "type": "install_apk",
+  "apk_url": "https://example.com/app-v2.apk",
+  "target_type": "all",
+  "created_at": "2026-03-08T10:00:00Z"
+}
+```
+
+### GET /api/v1/commands — List all commands
+
+```bash
+curl http://localhost:8080/api/v1/commands \
+  -H "X-API-Key: your-secret-key-here"
+```
+
+### GET /api/v1/commands/{id} — Command detail + delivery status
+
+```bash
+curl http://localhost:8080/api/v1/commands/<uuid> \
+  -H "X-API-Key: your-secret-key-here"
+```
+
+**Response:**
+```json
+{
+  "command": { "id": "...", "apk_url": "...", "target_type": "all" },
+  "deliveries": [
+    { "serial_number": "CE061715U9", "status": "installed", "updated_at": "..." },
+    { "serial_number": "CE061715U8", "status": "delivered", "updated_at": "..." }
+  ]
+}
+```
+
+### POST /api/v1/commands/{id}/ack — Device reports result
+
+Called by the device after it attempts installation:
+
+```bash
+# Successful install
+curl -X POST http://localhost:8080/api/v1/commands/<uuid>/ack \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-key-here" \
+  -d '{"serial_number": "CE061715U9", "status": "installed"}'
+
+# Failed install
+curl -X POST http://localhost:8080/api/v1/commands/<uuid>/ack \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-secret-key-here" \
+  -d '{"serial_number": "CE061715U9", "status": "failed"}'
+```
+
+---
+
 ## Dashboard
 
 Access the web dashboard at: `http://localhost:8080/`
@@ -334,10 +488,14 @@ Access the web dashboard at: `http://localhost:8080/`
 
 ### Pages
 
-| Route                     | Description                              |
-|---------------------------|------------------------------------------|
-| `/`                       | Device list — all devices, latest state  |
-| `/devices/{serial}`       | Device detail — history, battery chart   |
+| Route                     | Description                                        |
+|---------------------------|----------------------------------------------------|
+| `/`                       | Device list — all devices, latest state            |
+| `/devices/{serial}`       | Device detail — history, battery chart             |
+| `/groups`                 | Group list — create and manage groups              |
+| `/groups/{id}`            | Group detail — add/remove devices                  |
+| `/commands`               | Command list — send APK install commands           |
+| `/commands/{id}`          | Command detail — per-device delivery status        |
 
 ### Dashboard Features
 - All-devices table: serial number, build ID, battery %, last seen
@@ -345,6 +503,8 @@ Access the web dashboard at: `http://localhost:8080/`
 - Per-device checkin history table
 - Battery percentage chart over time
 - Auto-refresh every 60 seconds via HTMX polling
+- Group management UI
+- Command targeting (all / groups / specific devices) with live status
 
 ---
 
@@ -421,28 +581,31 @@ Optional fields to pass in `extra`:
 
 ### Polling Service (conceptual)
 
+The checkin response now includes any pending commands for the device. The client
+must read the response body, execute each command, then ack the result.
+
 ```java
 // Runs inside a foreground Service or JobScheduler job
-public void doCheckin() {
+public void doCheckin() throws Exception {
     String serial    = Build.getSerial();
     String buildId   = Build.DISPLAY;
-    int    battery   = getBatteryLevel();          // see below
-    String ipAddress = getWifiIpAddress();
+    int    battery   = getBatteryLevel();
+
+    JSONObject extra = new JSONObject();
+    extra.put("ip_address", getWifiIpAddress());
+    extra.put("installed_apps", getInstalledPackages()); // JSONArray of package names
 
     JSONObject body = new JSONObject();
     body.put("serial_number", serial);
     body.put("build_id",      buildId);
     body.put("battery_pct",   battery);
-
-    JSONObject extra = new JSONObject();
-    extra.put("ip_address", ipAddress);
-    body.put("extra", extra);
+    body.put("extra",         extra);
 
     URL url = new URL("http://mdm.internal:8080/api/v1/checkin");
     HttpURLConnection conn = (HttpURLConnection) url.openConnection();
     conn.setRequestMethod("POST");
     conn.setRequestProperty("Content-Type", "application/json");
-    conn.setRequestProperty("X-API-Key", BuildConfig.MDM_API_KEY);
+    conn.setRequestProperty("X-API-Key", MDM_API_KEY);
     conn.setDoOutput(true);
     conn.setConnectTimeout(10_000);
     conn.setReadTimeout(10_000);
@@ -451,7 +614,55 @@ public void doCheckin() {
         os.write(body.toString().getBytes(StandardCharsets.UTF_8));
     }
 
-    int responseCode = conn.getResponseCode(); // expect 200
+    if (conn.getResponseCode() != 200) return;
+
+    // Parse response — may contain pending commands
+    String responseBody = new String(conn.getInputStream().readAllBytes());
+    JSONObject resp     = new JSONObject(responseBody);
+    JSONArray  commands = resp.optJSONArray("commands");
+
+    if (commands != null) {
+        for (int i = 0; i < commands.length(); i++) {
+            JSONObject cmd = commands.getJSONObject(i);
+            String cmdId   = cmd.getString("id");
+            String apkUrl  = cmd.getString("apk_url");
+            String status  = installApk(apkUrl) ? "installed" : "failed";
+            ackCommand(serial, cmdId, status);
+        }
+    }
+}
+
+private void ackCommand(String serial, String commandId, String status) throws Exception {
+    JSONObject body = new JSONObject();
+    body.put("serial_number", serial);
+    body.put("status",        status);
+
+    URL url = new URL("http://mdm.internal:8080/api/v1/commands/" + commandId + "/ack");
+    HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+    conn.setRequestMethod("POST");
+    conn.setRequestProperty("Content-Type", "application/json");
+    conn.setRequestProperty("X-API-Key", MDM_API_KEY);
+    conn.setDoOutput(true);
+    conn.setConnectTimeout(10_000);
+    conn.setReadTimeout(10_000);
+    try (OutputStream os = conn.getOutputStream()) {
+        os.write(body.toString().getBytes(StandardCharsets.UTF_8));
+    }
+    conn.getResponseCode(); // consume
+}
+```
+
+#### Getting installed packages
+
+```java
+private JSONArray getInstalledPackages() {
+    PackageManager pm = context.getPackageManager();
+    List<PackageInfo> pkgs = pm.getInstalledPackages(0);
+    JSONArray arr = new JSONArray();
+    for (PackageInfo p : pkgs) {
+        arr.put(p.packageName);
+    }
+    return arr;
 }
 ```
 
@@ -538,7 +749,8 @@ curl -X POST http://localhost:8080/api/v1/checkin \
 
 #### Poll loop — simulate the 60-second cycle from adb shell
 
-Run this directly on the device via `adb shell`:
+Run this directly on the device via `adb shell`. The response is printed so you
+can see any pending commands the server returns:
 
 ```bash
 SERIAL=$(getprop ro.serialno)
@@ -548,16 +760,39 @@ SERVER="http://10.0.2.2:8080"   # 10.0.2.2 = host machine from Android emulator
 
 while true; do
   BATTERY=$(cat /sys/class/power_supply/battery/capacity 2>/dev/null || echo 100)
-  curl -s -X POST "$SERVER/api/v1/checkin" \
+  RESPONSE=$(curl -s -X POST "$SERVER/api/v1/checkin" \
     -H "Content-Type: application/json" \
     -H "X-API-Key: $API_KEY" \
     -d "{
       \"serial_number\": \"$SERIAL\",
       \"build_id\": \"$BUILD\",
       \"battery_pct\": $BATTERY
-    }" && echo "[$(date)] checkin OK"
+    }")
+  echo "[$(date)] $RESPONSE"
   sleep 60
 done
+```
+
+**Example response with a pending command:**
+```json
+{
+  "status": "ok",
+  "commands": [
+    {
+      "id": "a1b2c3d4-...",
+      "type": "install_apk",
+      "apk_url": "https://example.com/app-v2.apk"
+    }
+  ]
+}
+```
+
+**Ack a command after installation:**
+```bash
+curl -X POST $SERVER/api/v1/commands/a1b2c3d4-.../ack \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: $API_KEY" \
+  -d "{\"serial_number\": \"$SERIAL\", \"status\": \"installed\"}"
 ```
 
 #### Verify the device appeared on the server

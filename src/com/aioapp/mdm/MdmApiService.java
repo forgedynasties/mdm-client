@@ -61,37 +61,61 @@ public class MdmApiService {
 
     /**
      * POST /api/v1/checkin
+     * Returns the response body as a JSONObject on success, or null on failure.
      * Retries once on HTTP 5xx. Skips on 401 (bad key — needs code fix, not retry).
      */
-    public boolean checkin(JSONObject payload) {
+    public JSONObject checkin(JSONObject payload) {
         try {
-            int code = doPost("/api/v1/checkin", payload.toString());
-            if (code == HttpURLConnection.HTTP_OK) {
+            String body = payload.toString();
+            PostResult result = doPost("/api/v1/checkin", body);
+            if (result.code == HttpURLConnection.HTTP_OK) {
                 Log.d(TAG, "Checkin OK");
-                return true;
-            } else if (code >= 500) {
-                Log.w(TAG, "Server error " + code + " — retrying in 10s");
+                return new JSONObject(result.body);
+            } else if (result.code >= 500) {
+                Log.w(TAG, "Server error " + result.code + " — retrying in 10s");
                 Thread.sleep(10_000);
-                code = doPost("/api/v1/checkin", payload.toString());
-                if (code == HttpURLConnection.HTTP_OK) {
+                result = doPost("/api/v1/checkin", body);
+                if (result.code == HttpURLConnection.HTTP_OK) {
                     Log.d(TAG, "Checkin OK (retry)");
-                    return true;
+                    return new JSONObject(result.body);
                 }
-                Log.w(TAG, "Checkin retry failed: " + code + " — skipping cycle");
-            } else if (code == HttpURLConnection.HTTP_UNAUTHORIZED) {
+                Log.w(TAG, "Checkin retry failed: " + result.code + " — skipping cycle");
+            } else if (result.code == HttpURLConnection.HTTP_UNAUTHORIZED) {
                 Log.e(TAG, "Checkin 401: invalid API key — check API_KEY constant");
             } else {
-                Log.w(TAG, "Checkin unexpected response: " + code);
+                Log.w(TAG, "Checkin unexpected response: " + result.code);
             }
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
         } catch (Exception e) {
             Log.e(TAG, "Checkin failed: " + e.getMessage());
         }
-        return false;
+        return null;
     }
 
-    private int doPost(String endpoint, String jsonBody) throws Exception {
+    /**
+     * POST /api/v1/commands/{id}/ack
+     * Reports installation result to the server. status = "installed" | "failed"
+     */
+    public void ackCommand(String commandId, String serialNumber, String status) {
+        try {
+            JSONObject body = new JSONObject();
+            body.put("serial_number", serialNumber);
+            body.put("status", status);
+            PostResult result = doPost("/api/v1/commands/" + commandId + "/ack", body.toString());
+            Log.d(TAG, "Ack command " + commandId + " status=" + status + " response=" + result.code);
+        } catch (Exception e) {
+            Log.e(TAG, "Ack command failed: " + e.getMessage());
+        }
+    }
+
+    private static class PostResult {
+        final int code;
+        final String body;
+        PostResult(int code, String body) { this.code = code; this.body = body; }
+    }
+
+    private PostResult doPost(String endpoint, String jsonBody) throws Exception {
         URL url = new URL(apiBaseUrl + endpoint);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setRequestMethod("POST");
@@ -103,6 +127,13 @@ public class MdmApiService {
         try (OutputStream os = conn.getOutputStream()) {
             os.write(jsonBody.getBytes(StandardCharsets.UTF_8));
         }
-        return conn.getResponseCode();
+        int code = conn.getResponseCode();
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line);
+        } catch (Exception ignored) {}
+        return new PostResult(code, sb.toString());
     }
 }

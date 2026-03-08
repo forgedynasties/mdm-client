@@ -8,8 +8,14 @@ import android.os.*;
 import android.os.Environment;
 import android.os.StatFs;
 import android.util.Log;
+import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.InputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
 
 public class MdmService extends Service {
     private static final String TAG = "MdmService";
@@ -83,13 +89,78 @@ public class MdmService extends Service {
         new Thread(() -> {
             try {
                 JSONObject payload = buildCheckinPayload();
-                apiService.checkin(payload);
+                JSONObject response = apiService.checkin(payload);
+                if (response != null) {
+                    processCommands(response, getDeviceSerial());
+                }
             } catch (Exception e) {
                 Log.e(TAG, "Checkin error: " + e.getMessage());
             } finally {
                 polling = false;
             }
         }).start();
+    }
+
+    private void processCommands(JSONObject response, String serialNumber) {
+        JSONArray commands = response.optJSONArray("commands");
+        if (commands == null || commands.length() == 0) return;
+
+        for (int i = 0; i < commands.length(); i++) {
+            try {
+                JSONObject cmd = commands.getJSONObject(i);
+                String commandId = cmd.getString("id");
+                String apkUrl = cmd.getString("apk_url");
+                Log.i(TAG, "Processing command " + commandId + " apk=" + apkUrl);
+                String status = installApk(apkUrl) ? "installed" : "failed";
+                apiService.ackCommand(commandId, serialNumber, status);
+            } catch (Exception e) {
+                Log.e(TAG, "Command processing error: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Downloads the APK from apkUrl to a temp file and installs it via `pm install`.
+     * Returns true if installation succeeded.
+     */
+    private boolean installApk(String apkUrl) {
+        File apkFile = new File(getCacheDir(), "mdm_install_" + System.currentTimeMillis() + ".apk");
+        try {
+            // Download
+            URL url = new URL(apkUrl);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(30_000);
+            conn.setReadTimeout(60_000);
+            conn.connect();
+            if (conn.getResponseCode() != HttpURLConnection.HTTP_OK) {
+                Log.e(TAG, "APK download failed: HTTP " + conn.getResponseCode());
+                return false;
+            }
+            try (InputStream in = conn.getInputStream();
+                 FileOutputStream out = new FileOutputStream(apkFile)) {
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+            }
+            Log.i(TAG, "APK downloaded to " + apkFile.getAbsolutePath());
+
+            // Install via pm install
+            Process proc = Runtime.getRuntime().exec(
+                    new String[]{"pm", "install", "-r", apkFile.getAbsolutePath()});
+            int exitCode = proc.waitFor();
+            if (exitCode == 0) {
+                Log.i(TAG, "APK installed successfully");
+                return true;
+            } else {
+                Log.e(TAG, "pm install failed with exit code " + exitCode);
+                return false;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "installApk error: " + e.getMessage());
+            return false;
+        } finally {
+            apkFile.delete();
+        }
     }
 
     private JSONObject buildCheckinPayload() throws JSONException {
