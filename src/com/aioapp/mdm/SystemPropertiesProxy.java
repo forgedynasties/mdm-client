@@ -1,4 +1,4 @@
-package com.aioapp.otautil;
+package com.aioapp.mdm;
 
 import java.lang.reflect.Method;
 import android.util.Log;

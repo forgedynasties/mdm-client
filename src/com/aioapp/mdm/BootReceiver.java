@@ -1,4 +1,4 @@
-package com.aioapp.otautil;
+package com.aioapp.mdm;
 
 import android.content.BroadcastReceiver;
 import android.content.Context;

@@ -1,4 +1,4 @@
-package com.aioapp.otautil;
+package com.aioapp.mdm;
 
 import android.util.Log;
 import org.json.JSONObject;
@@ -14,15 +14,15 @@ public class MdmApiService {
 
     // Permanent config URL — this never changes.
     // It returns a JSON body with "api_base_url" so the actual server address can be updated remotely.
-    private static final String DISCOVERY_URL = "";
+    private static final String DISCOVERY_URL = "https://ota-update-packages.s3.us-west-2.amazonaws.com/mdm-config.json";
 
     // Fallback used when DISCOVERY_URL is empty or unreachable
-    private static final String DEFAULT_API_BASE_URL = "http://10.32.0.61:8080";
+    private static final String DEFAULT_API_BASE_URL = "http://10.32.0.246:8080";
 
     // Shared API key — must match DEVICE_API_KEY in server .env
     static final String API_KEY = "your-secret-key-here";
 
-    private static final long DEFAULT_POLL_INTERVAL_MS = 60_000;
+    private static final long DEFAULT_POLL_INTERVAL_MS = 30_000;
 
     private String apiBaseUrl = DEFAULT_API_BASE_URL;
     private long pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;

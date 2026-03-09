@@ -1,4 +1,4 @@
-package com.aioapp.otautil;
+package com.aioapp.mdm;
 
 import android.app.*;
 import android.content.*;
@@ -145,7 +145,7 @@ public class MdmService extends Service {
             Log.i(TAG, "APK downloaded to " + apkFile.getAbsolutePath());
 
             // Install via pm install
-            Process proc = Runtime.getRuntime().exec(
+            java.lang.Process proc = Runtime.getRuntime().exec(
                     new String[]{"pm", "install", "-r", apkFile.getAbsolutePath()});
             int exitCode = proc.waitFor();
             if (exitCode == 0) {
