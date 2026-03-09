@@ -2,6 +2,7 @@ package com.aioapp.mdm;
 
 import android.app.*;
 import android.content.*;
+import android.content.pm.PackageInstaller;
 import android.net.*;
 import android.net.wifi.*;
 import android.os.*;
@@ -14,8 +15,12 @@ import org.json.JSONObject;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
+import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 public class MdmService extends Service {
     private static final String TAG = "MdmService";
@@ -28,6 +33,7 @@ public class MdmService extends Service {
     private ConnectivityManager.NetworkCallback networkCallback;
     private volatile boolean networkAvailable = false;
     private volatile boolean polling = false;
+    private volatile boolean remoteConfigLoaded = false;
 
     private final Runnable pollRunnable = new Runnable() {
         @Override
@@ -52,10 +58,7 @@ public class MdmService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        new Thread(() -> {
-            apiService.loadRemoteConfig();
-            mainHandler.post(pollRunnable);
-        }).start();
+        mainHandler.post(pollRunnable);
         return START_STICKY;
     }
 
@@ -69,6 +72,12 @@ public class MdmService extends Service {
             public void onAvailable(Network network) {
                 networkAvailable = true;
                 Log.i(TAG, "Network available");
+                if (!remoteConfigLoaded) {
+                    new Thread(() -> {
+                        apiService.loadRemoteConfig();
+                        remoteConfigLoaded = true;
+                    }).start();
+                }
             }
 
             @Override
@@ -92,6 +101,10 @@ public class MdmService extends Service {
                 JSONObject response = apiService.checkin(payload);
                 if (response != null) {
                     processCommands(response, getDeviceSerial());
+                } else {
+                    Log.w(TAG, "Checkin failed, reloading remote config");
+                    apiService.loadRemoteConfig();
+                    remoteConfigLoaded = true;
                 }
             } catch (Exception e) {
                 Log.e(TAG, "Checkin error: " + e.getMessage());
@@ -119,10 +132,6 @@ public class MdmService extends Service {
         }
     }
 
-    /**
-     * Downloads the APK from apkUrl to a temp file and installs it via `pm install`.
-     * Returns true if installation succeeded.
-     */
     private boolean installApk(String apkUrl) {
         File apkFile = new File(getCacheDir(), "mdm_install_" + System.currentTimeMillis() + ".apk");
         try {
@@ -144,17 +153,56 @@ public class MdmService extends Service {
             }
             Log.i(TAG, "APK downloaded to " + apkFile.getAbsolutePath());
 
-            // Install via pm install
-            java.lang.Process proc = Runtime.getRuntime().exec(
-                    new String[]{"pm", "install", "-r", apkFile.getAbsolutePath()});
-            int exitCode = proc.waitFor();
-            if (exitCode == 0) {
-                Log.i(TAG, "APK installed successfully");
-                return true;
-            } else {
-                Log.e(TAG, "pm install failed with exit code " + exitCode);
-                return false;
+            // Install via PackageInstaller API
+            PackageInstaller installer = getPackageManager().getPackageInstaller();
+            PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
+                    PackageInstaller.SessionParams.MODE_FULL_INSTALL);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                params.setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED);
             }
+
+            CountDownLatch latch = new CountDownLatch(1);
+            AtomicBoolean success = new AtomicBoolean(false);
+
+            BroadcastReceiver resultReceiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    int status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS,
+                            PackageInstaller.STATUS_FAILURE);
+                    if (status == PackageInstaller.STATUS_SUCCESS) {
+                        Log.i(TAG, "APK installed successfully");
+                        success.set(true);
+                    } else if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                        Log.e(TAG, "PackageInstaller requires user action — check USER_ACTION_NOT_REQUIRED / INSTALL_PACKAGES permission");
+                    } else {
+                        String msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+                        int legacyStatus = intent.getIntExtra("android.content.pm.extra.LEGACY_STATUS", -999);
+                        Log.e(TAG, "PackageInstaller failed status=" + status + " legacy=" + legacyStatus + " msg=" + msg);
+                    }
+                    latch.countDown();
+                }
+            };
+
+            String action = "com.aioapp.mdm.INSTALL_RESULT_" + System.currentTimeMillis();
+            registerReceiver(resultReceiver, new IntentFilter(action), Context.RECEIVER_NOT_EXPORTED);
+
+            int sessionId = installer.createSession(params);
+            try (PackageInstaller.Session session = installer.openSession(sessionId)) {
+                try (InputStream in = new java.io.FileInputStream(apkFile);
+                     OutputStream out = session.openWrite("base.apk", 0, apkFile.length())) {
+                    byte[] buf = new byte[8192];
+                    int n;
+                    while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+                    session.fsync(out);
+                }
+                PendingIntent pi = PendingIntent.getBroadcast(this, sessionId,
+                        new Intent(action).setPackage(getPackageName()), PendingIntent.FLAG_IMMUTABLE);
+                session.commit(pi.getIntentSender());
+            }
+
+            latch.await(60, TimeUnit.SECONDS);
+            unregisterReceiver(resultReceiver);
+            return success.get();
         } catch (Exception e) {
             Log.e(TAG, "installApk error: " + e.getMessage());
             return false;
