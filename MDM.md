@@ -178,7 +178,7 @@ X-API-Key: your-secret-key-here
   "battery_pct": 87,
   "extra": {
     "ip_address": "192.168.1.42",
-    "wifi_ssid": "Corp-WiFi",
+    "wifi": "Corp-WiFi",
     "storage_free_gb": 12.4
   }
 }
@@ -224,7 +224,8 @@ curl -X POST http://localhost:8080/api/v1/checkin \
     "build_id": "aosp-eng 13 TP1A.220624.014",
     "battery_pct": 54,
     "extra": {
-      "ip_address": "10.0.0.55"
+      "ip_address": "10.0.0.55",
+      "wifi": "Corp-WiFi"
     }
   }'
 ```
@@ -740,7 +741,7 @@ curl -X POST http://localhost:8080/api/v1/checkin \
     "battery_pct": 72,
     "extra": {
       "ip_address": "192.168.1.101",
-      "wifi_ssid": "Corp-WiFi",
+      "wifi": "Corp-WiFi",
       "storage_free_gb": 14.2,
       "uptime_seconds": 86400
     }

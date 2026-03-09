@@ -174,7 +174,7 @@ public class MdmService extends Service {
         // Extra fields
         JSONObject extra = new JSONObject();
         extra.put("ip_address", getWifiIpAddress());
-        extra.put("wifi_ssid", getWifiSsid());
+        extra.put("wifi", getWifiSsid());
         extra.put("storage_free_gb", getStorageFreeGb());
         extra.put("uptime_seconds", SystemClock.elapsedRealtime() / 1000);
         payload.put("extra", extra);
