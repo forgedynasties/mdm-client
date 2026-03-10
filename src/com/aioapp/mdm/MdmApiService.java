@@ -112,13 +112,15 @@ public class MdmApiService {
 
     /**
      * POST /api/v1/commands/{id}/ack
-     * Reports installation result to the server. status = "installed" | "failed"
+     * Reports result to the server. status = "installed" | "completed" | "failed"
+     * output may be empty, stdout text, or base64-encoded binary.
      */
-    public void ackCommand(String commandId, String serialNumber, String status) {
+    public void ackCommand(String commandId, String serialNumber, String status, String output) {
         try {
             JSONObject body = new JSONObject();
             body.put("serial_number", serialNumber);
             body.put("status", status);
+            if (!output.isEmpty()) body.put("output", output);
             PostResult result = doPost("/api/v1/commands/" + commandId + "/ack", body.toString());
             Log.d(TAG, "Ack command " + commandId + " status=" + status + " response=" + result.code);
         } catch (Exception e) {

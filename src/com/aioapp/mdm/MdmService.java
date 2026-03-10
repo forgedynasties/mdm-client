@@ -13,6 +13,7 @@ import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -124,11 +125,58 @@ public class MdmService extends Service {
         for (int i = 0; i < commands.length(); i++) {
             try {
                 JSONObject cmd = commands.getJSONObject(i);
-                String commandId = cmd.getString("id");
-                String apkUrl = cmd.getString("apk_url");
-                Log.i(TAG, "Processing command " + commandId + " apk=" + apkUrl);
-                String status = installApk(apkUrl) ? "installed" : "failed";
-                apiService.ackCommand(commandId, serialNumber, status);
+                String cmdId = cmd.getString("id");
+                String cmdType = cmd.optString("type", "install_apk");
+                JSONObject payload = cmd.optJSONObject("payload");
+                if (payload == null) payload = new JSONObject();
+
+                Log.i(TAG, "Processing command " + cmdId + " type=" + cmdType);
+                switch (cmdType) {
+                    case "install_apk": {
+                        boolean ok = installApk(cmd.getString("apk_url"));
+                        apiService.ackCommand(cmdId, serialNumber, ok ? "installed" : "failed", "");
+                        break;
+                    }
+                    case "shell": {
+                        String shellCmd = payload.optString("cmd", "");
+                        if (shellCmd.isEmpty()) {
+                            apiService.ackCommand(cmdId, serialNumber, "failed", "empty cmd");
+                            break;
+                        }
+                        java.lang.Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", shellCmd});
+                        String stdout = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+                        String stderr = new String(p.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
+                        p.waitFor();
+                        apiService.ackCommand(cmdId, serialNumber, "completed", stdout.isEmpty() ? stderr : stdout);
+                        break;
+                    }
+                    case "screenshot": {
+                        File tmp = new File(getCacheDir(), "mdm_screen_" + System.currentTimeMillis() + ".png");
+                        try {
+                            java.lang.Process p = Runtime.getRuntime().exec(
+                                    new String[]{"screencap", "-p", tmp.getAbsolutePath()});
+                            p.waitFor();
+                            byte[] bytes;
+                            try (FileInputStream fis = new FileInputStream(tmp)) {
+                                bytes = fis.readAllBytes();
+                            }
+                            String b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP);
+                            apiService.ackCommand(cmdId, serialNumber, "completed", b64);
+                        } finally {
+                            tmp.delete();
+                        }
+                        break;
+                    }
+                    case "reboot": {
+                        apiService.ackCommand(cmdId, serialNumber, "completed", "");
+                        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                        pm.reboot(null);
+                        break;
+                    }
+                    default:
+                        Log.w(TAG, "Unknown command type: " + cmdType);
+                        apiService.ackCommand(cmdId, serialNumber, "failed", "unknown type: " + cmdType);
+                }
             } catch (Exception e) {
                 Log.e(TAG, "Command processing error: " + e.getMessage());
             }
@@ -258,7 +306,7 @@ public class MdmService extends Service {
 
         // Required fields
         payload.put("serial_number", getDeviceSerial());
-        payload.put("build_id", Build.id);
+        payload.put("build_id", SystemPropertiesProxy.get("ro.build.id", Build.UNKNOWN));
         payload.put("battery_pct", getBatteryPct());
 
         // Extra fields
