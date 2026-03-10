@@ -94,6 +94,23 @@ public class MdmApiService {
     }
 
     /**
+     * POST /api/v1/logcat
+     * Submits collected logcat output for a given request id.
+     */
+    public void postLogcat(String serialNumber, String requestId, String content) {
+        try {
+            JSONObject body = new JSONObject();
+            body.put("serial_number", serialNumber);
+            body.put("request_id", requestId);
+            body.put("content", content);
+            PostResult result = doPost("/api/v1/logcat", body.toString());
+            Log.d(TAG, "Logcat POST requestId=" + requestId + " response=" + result.code);
+        } catch (Exception e) {
+            Log.e(TAG, "postLogcat failed: " + e.getMessage());
+        }
+    }
+
+    /**
      * POST /api/v1/commands/{id}/ack
      * Reports installation result to the server. status = "installed" | "failed"
      */

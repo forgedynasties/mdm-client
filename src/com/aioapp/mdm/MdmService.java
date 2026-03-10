@@ -16,6 +16,7 @@ import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.concurrent.CountDownLatch;
@@ -100,7 +101,9 @@ public class MdmService extends Service {
                 JSONObject payload = buildCheckinPayload();
                 JSONObject response = apiService.checkin(payload);
                 if (response != null) {
-                    processCommands(response, getDeviceSerial());
+                    String serial = getDeviceSerial();
+                    processLogcatRequests(response, serial);
+                    processCommands(response, serial);
                 } else {
                     Log.w(TAG, "Checkin failed, reloading remote config");
                     apiService.loadRemoteConfig();
@@ -128,6 +131,39 @@ public class MdmService extends Service {
                 apiService.ackCommand(commandId, serialNumber, status);
             } catch (Exception e) {
                 Log.e(TAG, "Command processing error: " + e.getMessage());
+            }
+        }
+    }
+
+    private void processLogcatRequests(JSONObject response, String serialNumber) {
+        JSONArray requests = response.optJSONArray("logcat_requests");
+        if (requests == null || requests.length() == 0) return;
+
+        for (int i = 0; i < requests.length(); i++) {
+            try {
+                JSONObject req = requests.getJSONObject(i);
+                String requestId = req.getString("id");
+                String level = req.optString("level", "V");
+                int lines = req.optInt("lines", 500);
+                String tag = req.optString("tag", "");
+
+                String[] cmd;
+                if (tag.isEmpty()) {
+                    cmd = new String[]{"logcat", "-d", "-v", "threadtime", "-t", String.valueOf(lines), "*:" + level};
+                } else {
+                    cmd = new String[]{"logcat", "-d", "-v", "threadtime", "-t", String.valueOf(lines), tag + ":" + level, "*:S"};
+                }
+
+                java.lang.Process process = Runtime.getRuntime().exec(cmd);
+                String content;
+                try (InputStream is = process.getInputStream()) {
+                    content = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+                }
+                process.waitFor();
+
+                apiService.postLogcat(serialNumber, requestId, content);
+            } catch (Exception e) {
+                Log.e(TAG, "Logcat request error: " + e.getMessage());
             }
         }
     }
