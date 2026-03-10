@@ -149,17 +149,23 @@ public class MdmService extends Service {
 
                 String[] cmd;
                 if (tag.isEmpty()) {
-                    cmd = new String[]{"logcat", "-d", "-v", "threadtime", "-t", String.valueOf(lines), "*:" + level};
+                    cmd = new String[]{"logcat", "-t", String.valueOf(lines), "-v", "threadtime", "*:" + level};
                 } else {
-                    cmd = new String[]{"logcat", "-d", "-v", "threadtime", "-t", String.valueOf(lines), tag + ":" + level, "*:S"};
+                    cmd = new String[]{"logcat", "-t", String.valueOf(lines), "-v", "threadtime", tag + ":" + level, "*:S"};
                 }
+
+                Log.d(TAG, "Logcat cmd: " + java.util.Arrays.toString(cmd));
 
                 java.lang.Process process = Runtime.getRuntime().exec(cmd);
                 String content;
-                try (InputStream is = process.getInputStream()) {
+                try (InputStream is = process.getInputStream();
+                     InputStream es = process.getErrorStream()) {
                     content = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+                    String stderr = new String(es.readAllBytes(), StandardCharsets.UTF_8);
+                    if (!stderr.isEmpty()) Log.w(TAG, "Logcat stderr: " + stderr);
                 }
                 process.waitFor();
+                Log.d(TAG, "Logcat result: " + content.length() + " bytes");
 
                 apiService.postLogcat(serialNumber, requestId, content);
             } catch (Exception e) {
@@ -252,7 +258,7 @@ public class MdmService extends Service {
 
         // Required fields
         payload.put("serial_number", getDeviceSerial());
-        payload.put("build_id", Build.DISPLAY);
+        payload.put("build_id", Build.id);
         payload.put("battery_pct", getBatteryPct());
 
         // Extra fields
