@@ -29,6 +29,8 @@ public class MdmApiService {
 
     public long getPollInterval() { return pollIntervalMs; }
 
+    public void setPollInterval(long ms) { pollIntervalMs = ms; }
+
     /**
      * Fetches config from DISCOVERY_URL.
      * Expected response: { "api_base_url": "http://...", "poll_interval_ms": 60000 }
@@ -36,7 +38,7 @@ public class MdmApiService {
      */
     public void loadRemoteConfig() {
         if (DISCOVERY_URL.isEmpty()) {
-            Log.i(TAG, "No DISCOVERY_URL set, using defaults: apiBaseUrl=" + apiBaseUrl + ", pollIntervalMs=" + pollIntervalMs);
+            Log.i(TAG, "No DISCOVERY_URL set, using defaults: apiBaseUrl=" + apiBaseUrl);
             return;
         }
         try {
@@ -51,9 +53,8 @@ public class MdmApiService {
                 while ((line = br.readLine()) != null) sb.append(line);
                 JSONObject cfg = new JSONObject(sb.toString());
                 if (cfg.has("api_base_url")) apiBaseUrl = cfg.getString("api_base_url");
-                if (cfg.has("poll_interval_ms")) pollIntervalMs = cfg.getLong("poll_interval_ms");
             }
-            Log.i(TAG, "Remote config loaded: apiBaseUrl=" + apiBaseUrl + ", pollIntervalMs=" + pollIntervalMs);
+            Log.i(TAG, "Remote config loaded: apiBaseUrl=" + apiBaseUrl);
         } catch (Exception e) {
             Log.w(TAG, "Remote config fetch failed, using defaults: " + e.getMessage());
         }

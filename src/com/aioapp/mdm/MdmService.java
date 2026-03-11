@@ -105,6 +105,8 @@ public class MdmService extends Service {
                 JSONObject payload = buildCheckinPayload();
                 JSONObject response = apiService.checkin(payload);
                 if (response != null) {
+                    long pollMs = response.optLong("poll_interval_ms", 0);
+                    if (pollMs > 0) apiService.setPollInterval(pollMs);
                     String serial = getDeviceSerial();
                     processLogcatRequests(response, serial);
                     processCommands(response, serial);
