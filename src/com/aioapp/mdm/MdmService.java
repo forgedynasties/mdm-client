@@ -3,7 +3,6 @@ package com.aioapp.mdm;
 import android.app.*;
 import android.content.*;
 import android.content.pm.PackageInstaller;
-import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.net.*;
 import android.net.wifi.*;
@@ -313,12 +312,14 @@ public class MdmService extends Service {
     private JSONArray getInstalledApps() {
         JSONArray apps = new JSONArray();
         try {
-            List<PackageInfo> packages = getPackageManager().getInstalledPackages(0);
-            for (PackageInfo pkg : packages) {
+            PackageManager pm = getPackageManager();
+            Intent launcherIntent = new Intent(Intent.ACTION_MAIN, null);
+            launcherIntent.addCategory(Intent.CATEGORY_LAUNCHER);
+            List<android.content.pm.ResolveInfo> activities = pm.queryIntentActivities(launcherIntent, 0);
+            for (android.content.pm.ResolveInfo ri : activities) {
                 JSONObject app = new JSONObject();
-                app.put("package", pkg.packageName);
-                app.put("version_name", pkg.versionName != null ? pkg.versionName : "");
-                app.put("version_code", pkg.getLongVersionCode());
+                app.put("package", ri.activityInfo.packageName);
+                app.put("name", ri.loadLabel(pm).toString());
                 apps.put(app);
             }
         } catch (Exception e) {
