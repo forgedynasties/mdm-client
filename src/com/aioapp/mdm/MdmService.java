@@ -3,6 +3,8 @@ package com.aioapp.mdm;
 import android.app.*;
 import android.content.*;
 import android.content.pm.PackageInstaller;
+import android.content.pm.PackageInfo;
+import android.content.pm.PackageManager;
 import android.net.*;
 import android.net.wifi.*;
 import android.os.*;
@@ -20,6 +22,7 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.List;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -167,6 +170,10 @@ public class MdmService extends Service {
                         }
                         break;
                     }
+                    case "get_app_inventory": {
+                        apiService.ackCommand(cmdId, serialNumber, "completed", getInstalledApps().toString());
+                        break;
+                    }
                     case "reboot": {
                         apiService.ackCommand(cmdId, serialNumber, "completed", "");
                         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
@@ -301,6 +308,23 @@ public class MdmService extends Service {
         }
     }
 
+    private JSONArray getInstalledApps() {
+        JSONArray apps = new JSONArray();
+        try {
+            List<PackageInfo> packages = getPackageManager().getInstalledPackages(0);
+            for (PackageInfo pkg : packages) {
+                JSONObject app = new JSONObject();
+                app.put("package", pkg.packageName);
+                app.put("version_name", pkg.versionName != null ? pkg.versionName : "");
+                app.put("version_code", pkg.getLongVersionCode());
+                apps.put(app);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "getInstalledApps error: " + e.getMessage());
+        }
+        return apps;
+    }
+
     private JSONObject buildCheckinPayload() throws JSONException {
         JSONObject payload = new JSONObject();
 
@@ -316,6 +340,8 @@ public class MdmService extends Service {
         extra.put("storage_free_gb", getStorageFreeGb());
         extra.put("uptime_seconds", SystemClock.elapsedRealtime() / 1000);
         payload.put("extra", extra);
+
+        payload.put("installed_apps", getInstalledApps());
 
         return payload;
     }
