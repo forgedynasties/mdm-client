@@ -2,6 +2,8 @@ package com.aioapp.mdm;
 
 import android.app.*;
 import android.content.*;
+import android.app.admin.DevicePolicyManager;
+import android.content.ComponentName;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
 import android.net.*;
@@ -35,6 +37,8 @@ public class MdmService extends Service {
     private MdmApiService apiService;
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback networkCallback;
+    private DevicePolicyManager dpm;
+    private ComponentName adminComponent;
     private volatile boolean networkAvailable = false;
     private volatile boolean polling = false;
     private volatile boolean remoteConfigLoaded = false;
@@ -55,6 +59,9 @@ public class MdmService extends Service {
         mainHandler = new Handler(Looper.getMainLooper());
         apiService = new MdmApiService();
         connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
+        dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
+        adminComponent = new ComponentName(this, MdmAdminReceiver.class);
+        ensureDeviceOwner();
         createNotificationChannel();
         startForeground(NOTIFICATION_ID, buildNotification("MDM service running"));
         registerNetworkCallback();
@@ -64,6 +71,27 @@ public class MdmService extends Service {
     public int onStartCommand(Intent intent, int flags, int startId) {
         mainHandler.post(pollRunnable);
         return START_STICKY;
+    }
+
+    private void ensureDeviceOwner() {
+        if (dpm.isDeviceOwnerApp(getPackageName())) {
+            Log.i(TAG, "Already device owner");
+            return;
+        }
+        // Mirror what `adb shell dpm set-device-owner` does internally:
+        // setActiveAdmin must be called first, then setDeviceOwner.
+        try {
+            dpm.setActiveAdmin(adminComponent, true);
+            Log.i(TAG, "setActiveAdmin OK");
+        } catch (Exception e) {
+            Log.e(TAG, "setActiveAdmin failed: " + e.getMessage());
+        }
+        try {
+            boolean result = dpm.setDeviceOwner(adminComponent, android.os.UserHandle.USER_SYSTEM);
+            Log.i(TAG, "setDeviceOwner: " + result);
+        } catch (Exception e) {
+            Log.e(TAG, "setDeviceOwner failed: " + e.getMessage());
+        }
     }
 
     private void registerNetworkCallback() {
@@ -106,6 +134,10 @@ public class MdmService extends Service {
                 if (response != null) {
                     long pollMs = response.optLong("poll_interval_ms", 0);
                     if (pollMs > 0) apiService.setPollInterval(pollMs);
+                    JSONObject config = response.optJSONObject("config");
+                    if (config != null) {
+                        KioskManager.applyAndSave(MdmService.this, dpm, adminComponent, config);
+                    }
                     String serial = getDeviceSerial();
                     processLogcatRequests(response, serial);
                     processCommands(response, serial);
