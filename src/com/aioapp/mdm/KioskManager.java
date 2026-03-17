@@ -6,6 +6,7 @@ import android.app.admin.DevicePolicyManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.provider.Settings;
 import android.util.Log;
 import org.json.JSONObject;
@@ -30,7 +31,9 @@ public class KioskManager {
         try {
             boolean enabled = config.optBoolean("kiosk_enabled", false);
             String pkg = config.optString("kiosk_package", "");
-            int features = DevicePolicyManager.LOCK_TASK_FEATURE_NONE;
+            // LOCK_TASK_FEATURE_HOME enables the nav bar (back + home).
+            // Home just returns to the pinned app, so only back is functional.
+            int features = DevicePolicyManager.LOCK_TASK_FEATURE_HOME;
 
             if (enabled && !pkg.isEmpty()) {
                 dpm.setLockTaskPackages(admin, new String[]{pkg});
@@ -42,8 +45,18 @@ public class KioskManager {
                 Settings.Global.putString(ctx.getContentResolver(),
                         Settings.Global.POLICY_CONTROL, "");
 
+                // Set the kiosk app as the default home activity so that
+                // pressing back from the root activity relaunches it immediately.
                 Intent intent = ctx.getPackageManager().getLaunchIntentForPackage(pkg);
                 if (intent != null) {
+                    ComponentName launchComponent = intent.getComponent();
+                    if (launchComponent != null) {
+                        IntentFilter homeFilter = new IntentFilter(Intent.ACTION_MAIN);
+                        homeFilter.addCategory(Intent.CATEGORY_HOME);
+                        homeFilter.addCategory(Intent.CATEGORY_DEFAULT);
+                        dpm.addPersistentPreferredActivity(admin, homeFilter, launchComponent);
+                        Log.i(TAG, "Set persistent home: " + launchComponent.flattenToString());
+                    }
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                     ctx.startActivity(intent);
                     pinTaskAfterLaunch(ctx, pkg);
@@ -54,6 +67,7 @@ public class KioskManager {
             } else {
                 stopSystemLockTask();
                 dpm.setLockTaskPackages(admin, new String[]{});
+                dpm.clearPackagePersistentPreferredActivities(admin, pkg);
                 Settings.Global.putString(ctx.getContentResolver(),
                         Settings.Global.POLICY_CONTROL, "");
                 Log.i(TAG, "Kiosk disabled");
