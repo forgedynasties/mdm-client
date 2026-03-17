@@ -1,6 +1,6 @@
 package com.aioapp.mdm;
 
-import android.app.ActivityManager;
+import android.app.ActivityOptions;
 import android.app.ActivityTaskManager;
 import android.app.admin.DevicePolicyManager;
 import android.content.ComponentName;
@@ -9,8 +9,6 @@ import android.content.Intent;
 import android.provider.Settings;
 import android.util.Log;
 import org.json.JSONObject;
-
-import java.util.List;
 
 public class KioskManager {
     private static final String TAG = "KioskManager";
@@ -32,18 +30,29 @@ public class KioskManager {
             String pkg = config.optString("kiosk_package", "");
 
             if (enabled && !pkg.isEmpty()) {
+                // 1. Whitelist the package for lock task mode
                 dpm.setLockTaskPackages(admin, new String[]{pkg});
-                // Start with HOME to bring up the nav bar (shows back button).
-                dpm.setLockTaskFeatures(admin, DevicePolicyManager.LOCK_TASK_FEATURE_HOME);
+
+                // 2. LOCK_TASK_FEATURE_NONE hides home, overview, notifications,
+                //    status bar, and global actions. The back button ALWAYS remains
+                //    visible in lock task mode -- it cannot be hidden.
+                dpm.setLockTaskFeatures(admin, DevicePolicyManager.LOCK_TASK_FEATURE_NONE);
 
                 Settings.Global.putString(ctx.getContentResolver(),
                         Settings.Global.POLICY_CONTROL, "");
 
+                // 3. Use ActivityOptions.setLockTaskEnabled(true) to launch the
+                //    third-party app directly into REAL lock task mode (API 28+).
+                //    This is the correct approach for device owners. Do NOT use
+                //    ActivityTaskManager.startSystemLockTaskMode() -- that triggers
+                //    screen pinning (weaker mode with "unpin" toast).
                 Intent intent = ctx.getPackageManager().getLaunchIntentForPackage(pkg);
                 if (intent != null) {
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                    ctx.startActivity(intent);
-                    pinTaskAfterLaunch(ctx, dpm, admin, pkg);
+                    ActivityOptions options = ActivityOptions.makeBasic();
+                    options.setLockTaskEnabled(true);
+                    ctx.startActivity(intent, options.toBundle());
+                    Log.i(TAG, "Launched " + pkg + " in lock task mode");
                 } else {
                     Log.w(TAG, "No launch intent for kiosk package: " + pkg);
                 }
@@ -58,40 +67,6 @@ public class KioskManager {
         } catch (Exception e) {
             Log.e(TAG, "apply error: " + e.getMessage());
         }
-    }
-
-    /**
-     * Polls the running task list until the kiosk package appears, then pins it
-     * via the system-side lock task API. After pinning, switches features to NONE
-     * so only the back button remains visible (home and overview are hidden).
-     */
-    private static void pinTaskAfterLaunch(Context ctx, DevicePolicyManager dpm,
-                                           ComponentName admin, String pkg) {
-        new Thread(() -> {
-            ActivityManager am =
-                    (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
-            for (int i = 0; i < 10; i++) {
-                try {
-                    Thread.sleep(500);
-                    List<ActivityManager.RunningTaskInfo> tasks = am.getRunningTasks(20);
-                    for (ActivityManager.RunningTaskInfo task : tasks) {
-                        if (task.topActivity != null
-                                && pkg.equals(task.topActivity.getPackageName())) {
-                            ActivityTaskManager.getService().startSystemLockTaskMode(task.taskId);
-                            Log.i(TAG, "Lock task started: taskId=" + task.taskId);
-                            // Now switch to NONE to hide home button, back button stays.
-                            dpm.setLockTaskFeatures(admin, DevicePolicyManager.LOCK_TASK_FEATURE_NONE);
-                            Log.i(TAG, "Switched features to NONE (back only)");
-                            return;
-                        }
-                    }
-                } catch (Exception e) {
-                    Log.e(TAG, "pinTaskAfterLaunch error: " + e.getMessage());
-                    return;
-                }
-            }
-            Log.w(TAG, "Task not found after retries for pkg=" + pkg);
-        }).start();
     }
 
     private static void stopSystemLockTask() {
