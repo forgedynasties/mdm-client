@@ -30,8 +30,7 @@ public class KioskManager {
         try {
             boolean enabled = config.optBoolean("kiosk_enabled", false);
             String pkg = config.optString("kiosk_package", "");
-            int features = config.optInt("kiosk_features",
-                    DevicePolicyManager.LOCK_TASK_FEATURE_NONE);
+            int features = DevicePolicyManager.LOCK_TASK_FEATURE_NONE;
 
             if (enabled && !pkg.isEmpty()) {
                 dpm.setLockTaskPackages(admin, new String[]{pkg});
