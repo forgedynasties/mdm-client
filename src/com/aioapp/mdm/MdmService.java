@@ -374,6 +374,9 @@ public class MdmService extends Service {
         extra.put("wifi", getWifiSsid());
         extra.put("storage_free_gb", getStorageFreeGb());
         extra.put("uptime_seconds", SystemClock.elapsedRealtime() / 1000);
+        extra.put("wlc_status", getWlcStatus());
+        extra.put("ram_usage_mb", getRamUsageMb());
+        extra.put("timezone", java.util.TimeZone.getDefault().getID());
         payload.put("extra", extra);
 
         payload.put("installed_apps", getInstalledApps());
@@ -414,6 +417,35 @@ public class MdmService extends Service {
         if (wm == null || !wm.isWifiEnabled()) return null;
         WifiInfo info = wm.getConnectionInfo();
         return info != null ? info.getSSID() : null;
+    }
+
+    private JSONObject getRamUsageMb() throws JSONException {
+        android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+        android.app.ActivityManager.MemoryInfo mi = new android.app.ActivityManager.MemoryInfo();
+        am.getMemoryInfo(mi);
+        JSONObject ram = new JSONObject();
+        ram.put("total", mi.totalMem / (1024 * 1024));
+        ram.put("available", mi.availMem / (1024 * 1024));
+        ram.put("used", (mi.totalMem - mi.availMem) / (1024 * 1024));
+        return ram;
+    }
+
+    private int getWlcStatus() {
+        final String gpioPath = "/sys/devices/platform/soc/soc:customer_gpio/gpio27";
+        try {
+            for (int i = 0; i < 5; i++) {
+                java.io.BufferedReader reader = new java.io.BufferedReader(
+                        new java.io.FileReader(gpioPath));
+                String val = reader.readLine();
+                reader.close();
+                if (val != null && val.contains("0")) return 0;
+                Thread.sleep(100);
+            }
+            return 1;
+        } catch (Exception e) {
+            Log.e(TAG, "getWlcStatus error: " + e.getMessage());
+            return -1;
+        }
     }
 
     private double getStorageFreeGb() {
