@@ -36,11 +36,11 @@ public class KioskManager {
                 dpm.setLockTaskPackages(admin, new String[]{pkg});
                 dpm.setLockTaskFeatures(admin, features);
 
-                // Force-hide the navigation bar for the kiosk package.
-                // This survives lock task mode which always shows the navbar otherwise.
+                // Clear any immersive policy so the navigation bar is visible.
+                // Lock task with LOCK_TASK_FEATURE_NONE already hides home & recents,
+                // leaving only the back button shown.
                 Settings.Global.putString(ctx.getContentResolver(),
-                        Settings.Global.POLICY_CONTROL,
-                        "immersive.navigation=" + pkg);
+                        Settings.Global.POLICY_CONTROL, "");
 
                 Intent intent = ctx.getPackageManager().getLaunchIntentForPackage(pkg);
                 if (intent != null) {
