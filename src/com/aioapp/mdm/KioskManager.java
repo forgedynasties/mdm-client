@@ -6,7 +6,6 @@ import android.app.admin.DevicePolicyManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
-import android.content.IntentFilter;
 import android.provider.Settings;
 import android.util.Log;
 import org.json.JSONObject;
@@ -31,43 +30,27 @@ public class KioskManager {
         try {
             boolean enabled = config.optBoolean("kiosk_enabled", false);
             String pkg = config.optString("kiosk_package", "");
-            // LOCK_TASK_FEATURE_HOME enables the nav bar (back + home).
-            // Home just returns to the pinned app, so only back is functional.
-            int features = DevicePolicyManager.LOCK_TASK_FEATURE_HOME;
 
             if (enabled && !pkg.isEmpty()) {
                 dpm.setLockTaskPackages(admin, new String[]{pkg});
-                dpm.setLockTaskFeatures(admin, features);
+                // Start with HOME to bring up the nav bar (shows back button).
+                dpm.setLockTaskFeatures(admin, DevicePolicyManager.LOCK_TASK_FEATURE_HOME);
 
-                // Clear any immersive policy so the navigation bar is visible.
-                // Lock task with LOCK_TASK_FEATURE_NONE already hides home & recents,
-                // leaving only the back button shown.
                 Settings.Global.putString(ctx.getContentResolver(),
                         Settings.Global.POLICY_CONTROL, "");
 
-                // Set the kiosk app as the default home activity so that
-                // pressing back from the root activity relaunches it immediately.
                 Intent intent = ctx.getPackageManager().getLaunchIntentForPackage(pkg);
                 if (intent != null) {
-                    ComponentName launchComponent = intent.getComponent();
-                    if (launchComponent != null) {
-                        IntentFilter homeFilter = new IntentFilter(Intent.ACTION_MAIN);
-                        homeFilter.addCategory(Intent.CATEGORY_HOME);
-                        homeFilter.addCategory(Intent.CATEGORY_DEFAULT);
-                        dpm.addPersistentPreferredActivity(admin, homeFilter, launchComponent);
-                        Log.i(TAG, "Set persistent home: " + launchComponent.flattenToString());
-                    }
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                     ctx.startActivity(intent);
-                    pinTaskAfterLaunch(ctx, pkg);
+                    pinTaskAfterLaunch(ctx, dpm, admin, pkg);
                 } else {
                     Log.w(TAG, "No launch intent for kiosk package: " + pkg);
                 }
-                Log.i(TAG, "Kiosk enabled: pkg=" + pkg + " features=" + features);
+                Log.i(TAG, "Kiosk enabled: pkg=" + pkg);
             } else {
                 stopSystemLockTask();
                 dpm.setLockTaskPackages(admin, new String[]{});
-                dpm.clearPackagePersistentPreferredActivities(admin, pkg);
                 Settings.Global.putString(ctx.getContentResolver(),
                         Settings.Global.POLICY_CONTROL, "");
                 Log.i(TAG, "Kiosk disabled");
@@ -79,10 +62,11 @@ public class KioskManager {
 
     /**
      * Polls the running task list until the kiosk package appears, then pins it
-     * via the system-side lock task API. Retries for up to 5 seconds to handle
-     * slow app launches.
+     * via the system-side lock task API. After pinning, switches features to NONE
+     * so only the back button remains visible (home and overview are hidden).
      */
-    private static void pinTaskAfterLaunch(Context ctx, String pkg) {
+    private static void pinTaskAfterLaunch(Context ctx, DevicePolicyManager dpm,
+                                           ComponentName admin, String pkg) {
         new Thread(() -> {
             ActivityManager am =
                     (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
@@ -95,6 +79,9 @@ public class KioskManager {
                                 && pkg.equals(task.topActivity.getPackageName())) {
                             ActivityTaskManager.getService().startSystemLockTaskMode(task.taskId);
                             Log.i(TAG, "Lock task started: taskId=" + task.taskId);
+                            // Now switch to NONE to hide home button, back button stays.
+                            dpm.setLockTaskFeatures(admin, DevicePolicyManager.LOCK_TASK_FEATURE_NONE);
+                            Log.i(TAG, "Switched features to NONE (back only)");
                             return;
                         }
                     }
