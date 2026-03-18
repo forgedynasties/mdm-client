@@ -377,6 +377,7 @@ public class MdmService extends Service {
         extra.put("wlc_status", getWlcStatus());
         extra.put("ram_usage_mb", getRamUsageMb());
         extra.put("timezone", java.util.TimeZone.getDefault().getID());
+        extra.put("battery_temp_c", getBatteryTemperature());
         payload.put("extra", extra);
 
         payload.put("installed_apps", getInstalledApps());
@@ -400,6 +401,14 @@ public class MdmService extends Service {
         int scale = batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
         if (level < 0 || scale <= 0) return -1;
         return (int) ((level / (float) scale) * 100);
+    }
+
+    private float getBatteryTemperature() {
+        IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
+        Intent batteryStatus = registerReceiver(null, ifilter);
+        if (batteryStatus == null) return -999;
+        int tenths = batteryStatus.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0);
+        return tenths / 10.0f;
     }
 
     private String getWifiIpAddress() {
