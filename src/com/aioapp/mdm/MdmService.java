@@ -43,6 +43,9 @@ public class MdmService extends Service {
     private volatile boolean polling = false;
     private volatile boolean remoteConfigLoaded = false;
     private OtaUpdateManager otaUpdateManager;
+    private JSONArray cachedInstalledApps = null;
+    private BroadcastReceiver packageChangeReceiver;
+    private String lastNotificationText = "";
 
     private final Runnable pollRunnable = new Runnable() {
         @Override
@@ -50,7 +53,7 @@ public class MdmService extends Service {
             if (networkAvailable && !polling) {
                 performCheckin();
             }
-            mainHandler.postDelayed(this, apiService.getPollInterval());
+            mainHandler.postDelayed(this, getAdaptivePollInterval() * apiService.getBackoffMultiplier());
         }
     };
 
@@ -66,6 +69,7 @@ public class MdmService extends Service {
         createNotificationChannel();
         startForeground(NOTIFICATION_ID, buildNotification("MDM service running"));
         registerNetworkCallback();
+        registerPackageChangeReceiver();
     }
 
     @Override
@@ -390,24 +394,24 @@ public class MdmService extends Service {
     private JSONObject buildCheckinPayload() throws JSONException {
         JSONObject payload = new JSONObject();
 
-        // Required fields
         payload.put("serial_number", getDeviceSerial());
         payload.put("build_id", SystemPropertiesProxy.get("ro.build.id", Build.UNKNOWN));
-        payload.put("battery_pct", getBatteryPct());
 
-        // Extra fields
+        // Read battery intent once; extract both pct and temp from the same object
+        Intent batteryIntent = getBatteryIntent();
+        payload.put("battery_pct", extractBatteryPct(batteryIntent));
+
         JSONObject extra = new JSONObject();
-        extra.put("ip_address", getWifiIpAddress());
-        extra.put("wifi", getWifiSsid());
+        populateWifiInfo(extra);
         extra.put("storage_free_gb", getStorageFreeGb());
         extra.put("uptime_seconds", SystemClock.elapsedRealtime() / 1000);
         extra.put("wlc_status", getWlcStatus());
         extra.put("ram_usage_mb", getRamUsageMb());
         extra.put("timezone", java.util.TimeZone.getDefault().getID());
-        extra.put("battery_temp_c", getBatteryTemperature());
+        extra.put("battery_temp_c", extractBatteryTemperature(batteryIntent));
         payload.put("extra", extra);
 
-        payload.put("installed_apps", getInstalledApps());
+        payload.put("installed_apps", getCachedInstalledApps());
 
         return payload;
     }
@@ -420,9 +424,11 @@ public class MdmService extends Service {
         }
     }
 
-    private int getBatteryPct() {
-        IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
-        Intent batteryStatus = registerReceiver(null, ifilter);
+    private Intent getBatteryIntent() {
+        return registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+    }
+
+    private int extractBatteryPct(Intent batteryStatus) {
         if (batteryStatus == null) return -1;
         int level = batteryStatus.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
         int scale = batteryStatus.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
@@ -430,29 +436,29 @@ public class MdmService extends Service {
         return (int) ((level / (float) scale) * 100);
     }
 
-    private float getBatteryTemperature() {
-        IntentFilter ifilter = new IntentFilter(Intent.ACTION_BATTERY_CHANGED);
-        Intent batteryStatus = registerReceiver(null, ifilter);
+    private float extractBatteryTemperature(Intent batteryStatus) {
         if (batteryStatus == null) return -999;
         int tenths = batteryStatus.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0);
         return tenths / 10.0f;
     }
 
-    private String getWifiIpAddress() {
+    private void populateWifiInfo(JSONObject extra) throws JSONException {
         WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        if (wm == null || !wm.isWifiEnabled()) return null;
+        if (wm == null || !wm.isWifiEnabled()) {
+            extra.put("ip_address", JSONObject.NULL);
+            extra.put("wifi", JSONObject.NULL);
+            return;
+        }
         WifiInfo info = wm.getConnectionInfo();
-        if (info == null) return null;
+        if (info == null) {
+            extra.put("ip_address", JSONObject.NULL);
+            extra.put("wifi", JSONObject.NULL);
+            return;
+        }
         int ip4 = info.getIpAddress();
-        return String.format("%d.%d.%d.%d",
-                ip4 & 0xff, (ip4 >> 8) & 0xff, (ip4 >> 16) & 0xff, (ip4 >> 24) & 0xff);
-    }
-
-    private String getWifiSsid() {
-        WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
-        if (wm == null || !wm.isWifiEnabled()) return null;
-        WifiInfo info = wm.getConnectionInfo();
-        return info != null ? info.getSSID() : null;
+        extra.put("ip_address", String.format("%d.%d.%d.%d",
+                ip4 & 0xff, (ip4 >> 8) & 0xff, (ip4 >> 16) & 0xff, (ip4 >> 24) & 0xff));
+        extra.put("wifi", info.getSSID());
     }
 
     private JSONObject getRamUsageMb() throws JSONException {
@@ -468,16 +474,10 @@ public class MdmService extends Service {
 
     private int getWlcStatus() {
         final String gpioPath = "/sys/devices/platform/soc/soc:customer_gpio/gpio27";
-        try {
-            for (int i = 0; i < 5; i++) {
-                java.io.BufferedReader reader = new java.io.BufferedReader(
-                        new java.io.FileReader(gpioPath));
-                String val = reader.readLine();
-                reader.close();
-                if (val != null && val.contains("0")) return 0;
-                Thread.sleep(100);
-            }
-            return 1;
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(gpioPath))) {
+            String val = reader.readLine();
+            if (val == null) return -1;
+            return val.trim().equals("0") ? 0 : 1;
         } catch (Exception e) {
             Log.e(TAG, "getWlcStatus error: " + e.getMessage());
             return -1;
@@ -489,6 +489,49 @@ public class MdmService extends Service {
         long bytesAvailable = stat.getAvailableBlocksLong() * stat.getBlockSizeLong();
         double gb = bytesAvailable / (1024.0 * 1024.0 * 1024.0);
         return Math.round(gb * 10.0) / 10.0;
+    }
+
+    private void registerPackageChangeReceiver() {
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(Intent.ACTION_PACKAGE_ADDED);
+        filter.addAction(Intent.ACTION_PACKAGE_REMOVED);
+        filter.addAction(Intent.ACTION_PACKAGE_REPLACED);
+        filter.addDataScheme("package");
+        packageChangeReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                Log.i(TAG, "Package changed, invalidating app cache");
+                cachedInstalledApps = null;
+            }
+        };
+        registerReceiver(packageChangeReceiver, filter);
+    }
+
+    private JSONArray getCachedInstalledApps() {
+        if (cachedInstalledApps == null) {
+            cachedInstalledApps = getInstalledApps();
+        }
+        return cachedInstalledApps;
+    }
+
+    private long getAdaptivePollInterval() {
+        long base = apiService.getPollInterval();
+        Intent battery = getBatteryIntent();
+        if (battery == null) return base;
+        int plugged = battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
+        if (plugged != 0) return base; // charging — use normal interval
+        int level = battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
+        int scale = battery.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
+        int pct = (scale > 0 && level >= 0) ? (int) ((level / (float) scale) * 100) : 100;
+        if (pct <= 15) return base * 4;  // critical battery: poll 4× less often
+        if (pct <= 30) return base * 2;  // low battery: poll 2× less often
+        return base;
+    }
+
+    private void updateNotificationIfNeeded(String text) {
+        if (text.equals(lastNotificationText)) return;
+        lastNotificationText = text;
+        getSystemService(NotificationManager.class).notify(NOTIFICATION_ID, buildNotification(text));
     }
 
     private void createNotificationChannel() {
@@ -513,6 +556,9 @@ public class MdmService extends Service {
         mainHandler.removeCallbacks(pollRunnable);
         if (networkCallback != null) {
             try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) {}
+        }
+        if (packageChangeReceiver != null) {
+            try { unregisterReceiver(packageChangeReceiver); } catch (Exception ignored) {}
         }
         super.onDestroy();
     }

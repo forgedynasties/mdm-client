@@ -22,14 +22,21 @@ public class MdmApiService {
     // Shared API key — must match DEVICE_API_KEY in server .env
     static final String API_KEY = "your-secret-key-here";
 
-    private static final long DEFAULT_POLL_INTERVAL_MS = 30_000;
+    private static final long DEFAULT_POLL_INTERVAL_MS = 300_000; // 5 minutes
 
     private String apiBaseUrl = DEFAULT_API_BASE_URL;
     private long pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
+    private int consecutiveFailures = 0;
 
     public long getPollInterval() { return pollIntervalMs; }
 
     public void setPollInterval(long ms) { pollIntervalMs = ms; }
+
+    /** Returns a backoff multiplier (1, 2, 4, … up to 16×) based on consecutive failures. */
+    public long getBackoffMultiplier() {
+        if (consecutiveFailures == 0) return 1;
+        return Math.min((long) Math.pow(2, consecutiveFailures), 16);
+    }
 
     /**
      * Fetches config from DISCOVERY_URL.
@@ -63,32 +70,26 @@ public class MdmApiService {
     /**
      * POST /api/v1/checkin
      * Returns the response body as a JSONObject on success, or null on failure.
-     * Retries once on HTTP 5xx. Skips on 401 (bad key — needs code fix, not retry).
+     * Tracks consecutive failures for exponential backoff — no blocking retries.
      */
     public JSONObject checkin(JSONObject payload) {
         try {
-            String body = payload.toString();
-            PostResult result = doPost("/api/v1/checkin", body);
+            PostResult result = doPost("/api/v1/checkin", payload.toString());
             if (result.code == HttpURLConnection.HTTP_OK) {
+                consecutiveFailures = 0;
                 Log.d(TAG, "Checkin OK");
                 return new JSONObject(result.body);
             } else if (result.code >= 500) {
-                Log.w(TAG, "Server error " + result.code + " — retrying in 10s");
-                Thread.sleep(10_000);
-                result = doPost("/api/v1/checkin", body);
-                if (result.code == HttpURLConnection.HTTP_OK) {
-                    Log.d(TAG, "Checkin OK (retry)");
-                    return new JSONObject(result.body);
-                }
-                Log.w(TAG, "Checkin retry failed: " + result.code + " — skipping cycle");
+                consecutiveFailures++;
+                Log.w(TAG, "Server error " + result.code + " (failure #" + consecutiveFailures + ") — backing off");
             } else if (result.code == HttpURLConnection.HTTP_UNAUTHORIZED) {
                 Log.e(TAG, "Checkin 401: invalid API key — check API_KEY constant");
             } else {
+                consecutiveFailures++;
                 Log.w(TAG, "Checkin unexpected response: " + result.code);
             }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
         } catch (Exception e) {
+            consecutiveFailures++;
             Log.e(TAG, "Checkin failed: " + e.getMessage());
         }
         return null;
