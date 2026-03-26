@@ -112,6 +112,25 @@ public class MdmApiService {
     }
 
     /**
+     * POST /api/v1/ota/status
+     * Reports OTA progress. status = "downloaded" | "installed" | "error"
+     * errorCode is only included for status="error".
+     */
+    public void postOtaStatus(String serialNumber, String commandId, String status, String errorCode) {
+        try {
+            JSONObject body = new JSONObject();
+            body.put("serial_number", serialNumber);
+            body.put("command_id", commandId);
+            body.put("status", status);
+            if (errorCode != null && !errorCode.isEmpty()) body.put("error_code", errorCode);
+            PostResult result = doPost("/api/v1/ota/status", body.toString());
+            Log.d(TAG, "OTA status commandId=" + commandId + " status=" + status + " response=" + result.code);
+        } catch (Exception e) {
+            Log.e(TAG, "postOtaStatus failed: " + e.getMessage());
+        }
+    }
+
+    /**
      * POST /api/v1/commands/{id}/ack
      * Reports result to the server. status = "installed" | "completed" | "failed"
      * output may be empty, stdout text, or base64-encoded binary.

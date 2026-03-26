@@ -42,6 +42,7 @@ public class MdmService extends Service {
     private volatile boolean networkAvailable = false;
     private volatile boolean polling = false;
     private volatile boolean remoteConfigLoaded = false;
+    private OtaUpdateManager otaUpdateManager;
 
     private final Runnable pollRunnable = new Runnable() {
         @Override
@@ -211,6 +212,32 @@ public class MdmService extends Service {
                         apiService.ackCommand(cmdId, serialNumber, "completed", "");
                         PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
                         pm.reboot(null);
+                        break;
+                    }
+                    case "ota": {
+                        String updateUrl = payload.optString("update_url", "");
+                        long payloadOffset = payload.optLong("payload_offset", 0);
+                        long payloadSize = payload.optLong("payload_size", 0);
+                        JSONArray headersArr = payload.optJSONArray("payload_headers");
+                        String[] headers = new String[headersArr != null ? headersArr.length() : 0];
+                        if (headersArr != null) {
+                            for (int j = 0; j < headersArr.length(); j++) headers[j] = headersArr.getString(j);
+                        }
+                        final String otaCmdId = cmdId;
+                        final String otaSerial = serialNumber;
+                        otaUpdateManager = new OtaUpdateManager();
+                        otaUpdateManager.setListener(new OtaUpdateManager.Listener() {
+                            @Override public void onDownloadComplete() {
+                                new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "downloaded", null)).start();
+                            }
+                            @Override public void onInstallComplete() {
+                                new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "installed", null)).start();
+                            }
+                            @Override public void onError(String errorCode) {
+                                new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "error", errorCode)).start();
+                            }
+                        });
+                        otaUpdateManager.startUpdate(updateUrl, payloadOffset, payloadSize, headers);
                         break;
                     }
                     default:
