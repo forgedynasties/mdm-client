@@ -24,6 +24,7 @@ import java.nio.charset.StandardCharsets;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -44,6 +45,7 @@ public class MdmService extends Service {
     private volatile boolean remoteConfigLoaded = false;
     private OtaUpdateManager otaUpdateManager;
     private MdmWebSocketClient wsClient;
+    private final ConcurrentHashMap<String, OutputStream> shellSessions = new ConcurrentHashMap<>();
     private JSONArray cachedInstalledApps = null;
     private BroadcastReceiver packageChangeReceiver;
     private String lastNotificationText = "";
@@ -182,6 +184,17 @@ public class MdmService extends Service {
                     }
                 }).start();
                 break;
+            case "shell_start":
+                new Thread(() -> handleShellStart(msg.optString("session_id"))).start();
+                break;
+            case "shell_stdin":
+                handleShellStdin(msg.optString("session_id"), msg.optString("data"));
+                break;
+            case "shell_resize":
+                break; // pty resize not supported without pty4j
+            case "shell_close":
+                handleShellClose(msg.optString("session_id"));
+                break;
             default:
                 Log.w(TAG, "Unknown WS message type: " + type);
         }
@@ -270,6 +283,66 @@ public class MdmService extends Service {
             default:
                 Log.w(TAG, "Unknown command type: " + cmdType);
                 apiService.ackCommand(cmdId, serialNumber, "failed", "unknown type: " + cmdType);
+        }
+    }
+
+    private void handleShellStart(String sessionId) {
+        try {
+            java.lang.Process proc = Runtime.getRuntime().exec(new String[]{"/system/bin/sh"});
+            shellSessions.put(sessionId, proc.getOutputStream());
+            // Relay stdout back to server in chunks
+            new Thread(() -> {
+                byte[] buf = new byte[4096];
+                try (InputStream is = proc.getInputStream()) {
+                    int n;
+                    while ((n = is.read(buf)) != -1) {
+                        String chunk = new String(buf, 0, n, StandardCharsets.UTF_8);
+                        try {
+                            JSONObject out = new JSONObject();
+                            out.put("type", "shell_output");
+                            out.put("session_id", sessionId);
+                            out.put("data", chunk);
+                            wsClient.send(out.toString());
+                        } catch (Exception e) {
+                            Log.w(TAG, "shell_output send error: " + e.getMessage());
+                        }
+                    }
+                } catch (Exception e) {
+                    Log.w(TAG, "Shell stdout relay ended: " + e.getMessage());
+                } finally {
+                    shellSessions.remove(sessionId);
+                    try {
+                        JSONObject closed = new JSONObject();
+                        closed.put("type", "shell_closed");
+                        closed.put("session_id", sessionId);
+                        wsClient.send(closed.toString());
+                    } catch (Exception ignored) {}
+                }
+            }, "mdm-shell-out-" + sessionId).start();
+        } catch (Exception e) {
+            Log.e(TAG, "handleShellStart error: " + e.getMessage());
+        }
+    }
+
+    private void handleShellStdin(String sessionId, String data) {
+        OutputStream stdin = shellSessions.get(sessionId);
+        if (stdin == null) {
+            Log.w(TAG, "shell_stdin: no session " + sessionId);
+            return;
+        }
+        try {
+            stdin.write(data.getBytes(StandardCharsets.UTF_8));
+            stdin.flush();
+        } catch (Exception e) {
+            Log.w(TAG, "shell_stdin write error: " + e.getMessage());
+            shellSessions.remove(sessionId);
+        }
+    }
+
+    private void handleShellClose(String sessionId) {
+        OutputStream stdin = shellSessions.remove(sessionId);
+        if (stdin != null) {
+            try { stdin.close(); } catch (Exception ignored) {}
         }
     }
 

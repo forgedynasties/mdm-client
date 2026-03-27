@@ -190,6 +190,10 @@ public class MdmWebSocketClient {
         }
     }
 
+    public void send(String json) {
+        sendFrame(0x1, json.getBytes(StandardCharsets.UTF_8));
+    }
+
     /** Sends a masked WebSocket frame. Client → server frames must always be masked per RFC 6455. */
     private void sendFrame(int opcode, byte[] payload) {
         OutputStream out = this.outputStream;
