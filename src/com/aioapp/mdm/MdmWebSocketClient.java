@@ -224,7 +224,8 @@ public class MdmWebSocketClient {
                 out.flush();
             }
         } catch (IOException e) {
-            Log.w(TAG, "sendFrame failed: " + e.getMessage());
+            Log.e(TAG, "sendFrame failed opcode=0x" + Integer.toHexString(opcode)
+                    + " payloadLen=" + payload.length + ": " + e.getMessage());
             closeSocket();
         }
     }
