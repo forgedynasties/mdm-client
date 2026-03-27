@@ -78,6 +78,9 @@ public class MdmService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // removeCallbacks prevents duplicate loops when onStartCommand is called
+        // multiple times (LOCKED_BOOT_COMPLETED + BOOT_COMPLETED both fire on fresh boot)
+        mainHandler.removeCallbacks(pollRunnable);
         mainHandler.post(pollRunnable);
         return START_STICKY;
     }
