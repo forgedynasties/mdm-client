@@ -25,7 +25,6 @@ import java.nio.charset.StandardCharsets;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -46,7 +45,6 @@ public class MdmService extends Service {
     private volatile boolean remoteConfigLoaded = false;
     private OtaUpdateManager otaUpdateManager;
     private MdmWebSocketClient wsClient;
-    private final ConcurrentHashMap<String, OutputStream> shellSessions = new ConcurrentHashMap<>();
     private JSONArray cachedInstalledApps = null;
     private BroadcastReceiver packageChangeReceiver;
     private String lastNotificationText = "";
@@ -188,17 +186,6 @@ public class MdmService extends Service {
                     }
                 }).start();
                 break;
-            case "shell_start":
-                new Thread(() -> handleShellStart(msg.optString("session_id"))).start();
-                break;
-            case "shell_stdin":
-                handleShellStdin(msg.optString("session_id"), msg.optString("data"));
-                break;
-            case "shell_resize":
-                break; // pty resize not supported without pty4j
-            case "shell_close":
-                handleShellClose(msg.optString("session_id"));
-                break;
             default:
                 Log.w(TAG, "Unknown WS message type: " + type);
         }
@@ -319,84 +306,6 @@ public class MdmService extends Service {
         }
     }
 
-    private void handleShellStart(String sessionId) {
-        Log.i(TAG, "handleShellStart session=" + sessionId);
-        try {
-            java.lang.Process proc = Runtime.getRuntime().exec(new String[]{"/system/bin/sh"});
-            shellSessions.put(sessionId, proc.getOutputStream());
-            Log.i(TAG, "Shell process started session=" + sessionId);
-
-            // Drain stderr so the process never blocks on a full stderr pipe
-            new Thread(() -> {
-                try { proc.getErrorStream().transferTo(OutputStream.nullOutputStream()); } catch (Exception ignored) {}
-            }, "mdm-shell-err-" + sessionId).start();
-
-            // Relay stdout back to server in chunks
-            new Thread(() -> {
-                byte[] buf = new byte[4096];
-                try (InputStream is = proc.getInputStream()) {
-                    int n;
-                    while ((n = is.read(buf)) != -1) {
-                        String chunk = new String(buf, 0, n, StandardCharsets.UTF_8);
-                        Log.d(TAG, "shell_output chunk=" + n + "b session=" + sessionId);
-                        try {
-                            JSONObject out = new JSONObject();
-                            out.put("type", "shell_output");
-                            out.put("session_id", sessionId);
-                            out.put("data", chunk);
-                            wsClient.send(out.toString());
-                        } catch (Exception e) {
-                            Log.w(TAG, "shell_output send error session=" + sessionId + ": " + e.getMessage());
-                        }
-                    }
-                    Log.i(TAG, "Shell stdout EOF session=" + sessionId);
-                } catch (Exception e) {
-                    Log.w(TAG, "Shell stdout relay exception session=" + sessionId + ": " + e.getMessage());
-                } finally {
-                    shellSessions.remove(sessionId);
-                    try {
-                        int exitCode = proc.waitFor();
-                        Log.i(TAG, "Shell process exited code=" + exitCode + " session=" + sessionId);
-                        JSONObject exit = new JSONObject();
-                        exit.put("type", "shell_exit");
-                        exit.put("session_id", sessionId);
-                        exit.put("exit_code", exitCode);
-                        wsClient.send(exit.toString());
-                    } catch (Exception e) {
-                        Log.w(TAG, "shell_exit send failed session=" + sessionId + ": " + e.getMessage());
-                    }
-                }
-            }, "mdm-shell-out-" + sessionId).start();
-        } catch (Exception e) {
-            Log.e(TAG, "handleShellStart error session=" + sessionId + ": " + e.getMessage());
-        }
-    }
-
-    private void handleShellStdin(String sessionId, String data) {
-        OutputStream stdin = shellSessions.get(sessionId);
-        if (stdin == null) {
-            Log.w(TAG, "shell_stdin: no active session=" + sessionId);
-            return;
-        }
-        Log.d(TAG, "shell_stdin " + data.length() + "b session=" + sessionId);
-        try {
-            // xterm.js sends \r for Enter; without a PTY the shell only recognises \n
-            String normalized = data.replace("\r", "\n");
-            stdin.write(normalized.getBytes(StandardCharsets.UTF_8));
-            stdin.flush();
-        } catch (Exception e) {
-            Log.w(TAG, "shell_stdin write error session=" + sessionId + ": " + e.getMessage());
-            shellSessions.remove(sessionId);
-        }
-    }
-
-    private void handleShellClose(String sessionId) {
-        Log.i(TAG, "handleShellClose session=" + sessionId);
-        OutputStream stdin = shellSessions.remove(sessionId);
-        if (stdin != null) {
-            try { stdin.close(); } catch (Exception ignored) {}
-        }
-    }
 
     private void processWsLogcatRequest(JSONObject req) throws Exception {
         String requestId = req.getString("id");
