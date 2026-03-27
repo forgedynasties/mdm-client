@@ -19,6 +19,9 @@ public class MdmApiService {
     // Fallback used when DISCOVERY_URL is empty or unreachable
     private static final String DEFAULT_API_BASE_URL = "http://10.32.0.246:8080";
 
+    // When true, always use DEFAULT_API_BASE_URL and skip the remote config fetch.
+    private static final boolean USE_HARDCODED_API_URL = false;
+
     // Shared API key — must match DEVICE_API_KEY in server .env
     static final String API_KEY = "your-secret-key-here";
 
@@ -44,6 +47,10 @@ public class MdmApiService {
      * Falls back to defaults if DISCOVERY_URL is empty or the request fails.
      */
     public void loadRemoteConfig() {
+        if (USE_HARDCODED_API_URL) {
+            Log.i(TAG, "USE_HARDCODED_API_URL=true, skipping discovery: apiBaseUrl=" + apiBaseUrl);
+            return;
+        }
         if (DISCOVERY_URL.isEmpty()) {
             Log.i(TAG, "No DISCOVERY_URL set, using defaults: apiBaseUrl=" + apiBaseUrl);
             return;
