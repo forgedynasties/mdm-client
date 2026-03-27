@@ -43,6 +43,7 @@ public class MdmService extends Service {
     private volatile boolean polling = false;
     private volatile boolean remoteConfigLoaded = false;
     private OtaUpdateManager otaUpdateManager;
+    private MdmWebSocketClient wsClient;
     private JSONArray cachedInstalledApps = null;
     private BroadcastReceiver packageChangeReceiver;
     private String lastNotificationText = "";
@@ -113,6 +114,7 @@ public class MdmService extends Service {
                     new Thread(() -> {
                         apiService.loadRemoteConfig();
                         remoteConfigLoaded = true;
+                        startWebSocket();
                     }).start();
                 }
             }
@@ -137,15 +139,10 @@ public class MdmService extends Service {
                 JSONObject payload = buildCheckinPayload();
                 JSONObject response = apiService.checkin(payload);
                 if (response != null) {
-                    long pollMs = response.optLong("poll_interval_ms", 0);
-                    if (pollMs > 0) apiService.setPollInterval(pollMs);
                     JSONObject config = response.optJSONObject("config");
                     if (config != null) {
                         KioskManager.applyAndSave(MdmService.this, dpm, adminComponent, config);
                     }
-                    String serial = getDeviceSerial();
-                    processLogcatRequests(response, serial);
-                    processCommands(response, serial);
                 } else {
                     Log.w(TAG, "Checkin failed, reloading remote config");
                     apiService.loadRemoteConfig();
@@ -159,138 +156,150 @@ public class MdmService extends Service {
         }).start();
     }
 
-    private void processCommands(JSONObject response, String serialNumber) {
-        JSONArray commands = response.optJSONArray("commands");
-        if (commands == null || commands.length() == 0) return;
+    private synchronized void startWebSocket() {
+        if (wsClient != null) return;
+        String serial = getDeviceSerial();
+        wsClient = new MdmWebSocketClient(apiService.getApiBaseUrl(), serial, MdmApiService.API_KEY);
+        wsClient.setListener(this::handleWsMessage);
+        wsClient.start();
+        Log.i(TAG, "WebSocket client started");
+    }
 
-        for (int i = 0; i < commands.length(); i++) {
-            try {
-                JSONObject cmd = commands.getJSONObject(i);
-                String cmdId = cmd.getString("id");
-                String cmdType = cmd.optString("type", "install_apk");
-                JSONObject payload = cmd.optJSONObject("payload");
-                if (payload == null) payload = new JSONObject();
-
-                Log.i(TAG, "Processing command " + cmdId + " type=" + cmdType);
-                switch (cmdType) {
-                    case "install_apk": {
-                        boolean ok = installApk(cmd.getString("apk_url"));
-                        apiService.ackCommand(cmdId, serialNumber, ok ? "installed" : "failed", "");
-                        break;
+    private void handleWsMessage(JSONObject msg) {
+        String type = msg.optString("type", "");
+        switch (type) {
+            case "command":
+                new Thread(() -> {
+                    try { processWsCommand(msg); } catch (Exception e) {
+                        Log.e(TAG, "WS command error: " + e.getMessage());
                     }
-                    case "shell": {
-                        String shellCmd = payload.optString("cmd", "");
-                        if (shellCmd.isEmpty()) {
-                            apiService.ackCommand(cmdId, serialNumber, "failed", "empty cmd");
-                            break;
-                        }
-                        java.lang.Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", shellCmd});
-                        String stdout = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-                        String stderr = new String(p.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
-                        p.waitFor();
-                        apiService.ackCommand(cmdId, serialNumber, "completed", stdout.isEmpty() ? stderr : stdout);
-                        break;
+                }).start();
+                break;
+            case "logcat_request":
+                new Thread(() -> {
+                    try { processWsLogcatRequest(msg); } catch (Exception e) {
+                        Log.e(TAG, "WS logcat error: " + e.getMessage());
                     }
-                    case "screenshot": {
-                        File tmp = new File(getCacheDir(), "mdm_screen_" + System.currentTimeMillis() + ".png");
-                        try {
-                            java.lang.Process p = Runtime.getRuntime().exec(
-                                    new String[]{"screencap", "-p", tmp.getAbsolutePath()});
-                            p.waitFor();
-                            byte[] bytes;
-                            try (FileInputStream fis = new FileInputStream(tmp)) {
-                                bytes = fis.readAllBytes();
-                            }
-                            String b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP);
-                            apiService.ackCommand(cmdId, serialNumber, "completed", b64);
-                        } finally {
-                            tmp.delete();
-                        }
-                        break;
-                    }
-                    case "get_app_inventory": {
-                        apiService.ackCommand(cmdId, serialNumber, "completed", getInstalledApps().toString());
-                        break;
-                    }
-                    case "reboot": {
-                        apiService.ackCommand(cmdId, serialNumber, "completed", "");
-                        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
-                        pm.reboot(null);
-                        break;
-                    }
-                    case "ota": {
-                        String updateUrl = payload.optString("update_url", "");
-                        long payloadOffset = payload.optLong("payload_offset", 0);
-                        long payloadSize = payload.optLong("payload_size", 0);
-                        JSONArray headersArr = payload.optJSONArray("payload_headers");
-                        String[] headers = new String[headersArr != null ? headersArr.length() : 0];
-                        if (headersArr != null) {
-                            for (int j = 0; j < headersArr.length(); j++) headers[j] = headersArr.getString(j);
-                        }
-                        final String otaCmdId = cmdId;
-                        final String otaSerial = serialNumber;
-                        otaUpdateManager = new OtaUpdateManager();
-                        otaUpdateManager.setListener(new OtaUpdateManager.Listener() {
-                            @Override public void onDownloadComplete() {
-                                new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "downloaded", null)).start();
-                            }
-                            @Override public void onInstallComplete() {
-                                new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "installed", null)).start();
-                            }
-                            @Override public void onError(String errorCode) {
-                                new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "error", errorCode)).start();
-                            }
-                        });
-                        otaUpdateManager.startUpdate(updateUrl, payloadOffset, payloadSize, headers);
-                        break;
-                    }
-                    default:
-                        Log.w(TAG, "Unknown command type: " + cmdType);
-                        apiService.ackCommand(cmdId, serialNumber, "failed", "unknown type: " + cmdType);
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "Command processing error: " + e.getMessage());
-            }
+                }).start();
+                break;
+            default:
+                Log.w(TAG, "Unknown WS message type: " + type);
         }
     }
 
-    private void processLogcatRequests(JSONObject response, String serialNumber) {
-        JSONArray requests = response.optJSONArray("logcat_requests");
-        if (requests == null || requests.length() == 0) return;
+    private void processWsCommand(JSONObject cmd) throws Exception {
+        String cmdId = cmd.getString("id");
+        String cmdType = cmd.optString("command_type", "install_apk");
+        JSONObject payload = cmd.optJSONObject("payload");
+        if (payload == null) payload = new JSONObject();
+        String serialNumber = getDeviceSerial();
 
-        for (int i = 0; i < requests.length(); i++) {
-            try {
-                JSONObject req = requests.getJSONObject(i);
-                String requestId = req.getString("id");
-                String level = req.optString("level", "V");
-                int lines = req.optInt("lines", 500);
-                String tag = req.optString("tag", "");
-
-                String[] cmd;
-                if (tag.isEmpty()) {
-                    cmd = new String[]{"logcat", "-t", String.valueOf(lines), "-v", "threadtime", "*:" + level};
-                } else {
-                    cmd = new String[]{"logcat", "-t", String.valueOf(lines), "-v", "threadtime", tag + ":" + level, "*:S"};
-                }
-
-                Log.d(TAG, "Logcat cmd: " + java.util.Arrays.toString(cmd));
-
-                java.lang.Process process = Runtime.getRuntime().exec(cmd);
-                String content;
-                try (InputStream is = process.getInputStream();
-                     InputStream es = process.getErrorStream()) {
-                    content = new String(is.readAllBytes(), StandardCharsets.UTF_8);
-                    String stderr = new String(es.readAllBytes(), StandardCharsets.UTF_8);
-                    if (!stderr.isEmpty()) Log.w(TAG, "Logcat stderr: " + stderr);
-                }
-                process.waitFor();
-                Log.d(TAG, "Logcat result: " + content.length() + " bytes");
-
-                apiService.postLogcat(serialNumber, requestId, content);
-            } catch (Exception e) {
-                Log.e(TAG, "Logcat request error: " + e.getMessage());
+        Log.i(TAG, "Processing WS command " + cmdId + " type=" + cmdType);
+        switch (cmdType) {
+            case "install_apk": {
+                boolean ok = installApk(cmd.getString("apk_url"));
+                apiService.ackCommand(cmdId, serialNumber, ok ? "installed" : "failed", "");
+                break;
             }
+            case "shell": {
+                String shellCmd = payload.optString("cmd", "");
+                if (shellCmd.isEmpty()) {
+                    apiService.ackCommand(cmdId, serialNumber, "failed", "empty cmd");
+                    break;
+                }
+                java.lang.Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", shellCmd});
+                String stdout = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
+                String stderr = new String(p.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
+                p.waitFor();
+                apiService.ackCommand(cmdId, serialNumber, "completed", stdout.isEmpty() ? stderr : stdout);
+                break;
+            }
+            case "screenshot": {
+                File tmp = new File(getCacheDir(), "mdm_screen_" + System.currentTimeMillis() + ".png");
+                try {
+                    java.lang.Process p = Runtime.getRuntime().exec(
+                            new String[]{"screencap", "-p", tmp.getAbsolutePath()});
+                    p.waitFor();
+                    byte[] bytes;
+                    try (FileInputStream fis = new FileInputStream(tmp)) {
+                        bytes = fis.readAllBytes();
+                    }
+                    String b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP);
+                    apiService.ackCommand(cmdId, serialNumber, "completed", b64);
+                } finally {
+                    tmp.delete();
+                }
+                break;
+            }
+            case "get_app_inventory": {
+                apiService.ackCommand(cmdId, serialNumber, "completed", getInstalledApps().toString());
+                break;
+            }
+            case "reboot": {
+                // Server marks reboot commands completed at delivery — no ack needed
+                PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+                pm.reboot(null);
+                break;
+            }
+            case "ota": {
+                String updateUrl = payload.optString("update_url", "");
+                long payloadOffset = payload.optLong("payload_offset", 0);
+                long payloadSize = payload.optLong("payload_size", 0);
+                JSONArray headersArr = payload.optJSONArray("payload_headers");
+                String[] headers = new String[headersArr != null ? headersArr.length() : 0];
+                if (headersArr != null) {
+                    for (int j = 0; j < headersArr.length(); j++) headers[j] = headersArr.getString(j);
+                }
+                final String otaCmdId = cmdId;
+                final String otaSerial = serialNumber;
+                otaUpdateManager = new OtaUpdateManager();
+                otaUpdateManager.setListener(new OtaUpdateManager.Listener() {
+                    @Override public void onDownloadComplete() {
+                        new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "downloaded", null)).start();
+                    }
+                    @Override public void onInstallComplete() {
+                        new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "installed", null)).start();
+                    }
+                    @Override public void onError(String errorCode) {
+                        new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "error", errorCode)).start();
+                    }
+                });
+                otaUpdateManager.startUpdate(updateUrl, payloadOffset, payloadSize, headers);
+                break;
+            }
+            default:
+                Log.w(TAG, "Unknown command type: " + cmdType);
+                apiService.ackCommand(cmdId, serialNumber, "failed", "unknown type: " + cmdType);
         }
+    }
+
+    private void processWsLogcatRequest(JSONObject req) throws Exception {
+        String requestId = req.getString("id");
+        String level = req.optString("level", "V");
+        int lines = req.optInt("lines", 500);
+        String tag = req.optString("tag", "");
+
+        String[] cmd;
+        if (tag.isEmpty()) {
+            cmd = new String[]{"logcat", "-t", String.valueOf(lines), "-v", "threadtime", "*:" + level};
+        } else {
+            cmd = new String[]{"logcat", "-t", String.valueOf(lines), "-v", "threadtime", tag + ":" + level, "*:S"};
+        }
+
+        Log.d(TAG, "Logcat cmd: " + java.util.Arrays.toString(cmd));
+
+        java.lang.Process process = Runtime.getRuntime().exec(cmd);
+        String content;
+        try (InputStream is = process.getInputStream();
+             InputStream es = process.getErrorStream()) {
+            content = new String(is.readAllBytes(), StandardCharsets.UTF_8);
+            String stderr = new String(es.readAllBytes(), StandardCharsets.UTF_8);
+            if (!stderr.isEmpty()) Log.w(TAG, "Logcat stderr: " + stderr);
+        }
+        process.waitFor();
+        Log.d(TAG, "Logcat result: " + content.length() + " bytes");
+
+        apiService.postLogcat(getDeviceSerial(), requestId, content);
     }
 
     private boolean installApk(String apkUrl) {
@@ -554,6 +563,7 @@ public class MdmService extends Service {
     @Override
     public void onDestroy() {
         mainHandler.removeCallbacks(pollRunnable);
+        if (wsClient != null) wsClient.stop();
         if (networkCallback != null) {
             try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) {}
         }

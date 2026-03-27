@@ -31,6 +31,8 @@ public class MdmApiService {
     private long pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
     private int consecutiveFailures = 0;
 
+    public String getApiBaseUrl() { return apiBaseUrl; }
+
     public long getPollInterval() { return pollIntervalMs; }
 
     public void setPollInterval(long ms) { pollIntervalMs = ms; }
@@ -43,7 +45,7 @@ public class MdmApiService {
 
     /**
      * Fetches config from DISCOVERY_URL.
-     * Expected response: { "api_base_url": "http://...", "poll_interval_ms": 60000 }
+     * Expected response: { "api_base_url": "http://..." }
      * Falls back to defaults if DISCOVERY_URL is empty or the request fails.
      */
     public void loadRemoteConfig() {
