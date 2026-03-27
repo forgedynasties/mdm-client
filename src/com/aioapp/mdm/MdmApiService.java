@@ -25,7 +25,7 @@ public class MdmApiService {
     // Shared API key — must match DEVICE_API_KEY in server .env
     static final String API_KEY = "your-secret-key-here";
 
-    private static final long DEFAULT_POLL_INTERVAL_MS = 300_000; // 5 minutes
+    private static final long DEFAULT_POLL_INTERVAL_MS = 30_000; // 30 seconds
 
     private String apiBaseUrl = DEFAULT_API_BASE_URL;
     private long pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
