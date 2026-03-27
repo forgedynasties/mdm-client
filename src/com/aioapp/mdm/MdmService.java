@@ -15,6 +15,7 @@ import android.util.Log;
 import org.json.JSONArray;
 import org.json.JSONException;
 import org.json.JSONObject;
+import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileOutputStream;
@@ -221,10 +222,39 @@ public class MdmService extends Service {
                     break;
                 }
                 java.lang.Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", shellCmd});
-                String stdout = new String(p.getInputStream().readAllBytes(), StandardCharsets.UTF_8);
-                String stderr = new String(p.getErrorStream().readAllBytes(), StandardCharsets.UTF_8);
-                p.waitFor();
-                apiService.ackCommand(cmdId, serialNumber, "completed", stdout.isEmpty() ? stderr : stdout);
+                // Drain stderr in a side thread; collect it in case stdout is empty
+                ByteArrayOutputStream stderrBuf = new ByteArrayOutputStream();
+                Thread stderrThread = new Thread(() -> {
+                    try { p.getErrorStream().transferTo(stderrBuf); } catch (Exception ignored) {}
+                });
+                stderrThread.start();
+                // Stream stdout chunks via WebSocket so the browser sees them immediately
+                StringBuilder collected = new StringBuilder();
+                try (InputStream is = p.getInputStream()) {
+                    byte[] buf = new byte[4096];
+                    int n;
+                    while ((n = is.read(buf)) != -1) {
+                        String chunk = new String(buf, 0, n, StandardCharsets.UTF_8);
+                        collected.append(chunk);
+                        JSONObject outFrame = new JSONObject();
+                        outFrame.put("type", "command_output");
+                        outFrame.put("command_id", cmdId);
+                        outFrame.put("chunk", chunk);
+                        wsClient.send(outFrame.toString());
+                    }
+                }
+                int exitCode = p.waitFor();
+                stderrThread.join();
+                // Signal stream end so the browser SSE closes
+                JSONObject doneFrame = new JSONObject();
+                doneFrame.put("type", "command_done");
+                doneFrame.put("command_id", cmdId);
+                doneFrame.put("exit_code", exitCode);
+                wsClient.send(doneFrame.toString());
+                // HTTP-ack to persist status in DB
+                String output = collected.length() > 0 ? collected.toString()
+                        : stderrBuf.toString(StandardCharsets.UTF_8);
+                apiService.ackCommand(cmdId, serialNumber, exitCode == 0 ? "completed" : "failed", output);
                 break;
             }
             case "screenshot": {
@@ -290,6 +320,12 @@ public class MdmService extends Service {
         try {
             java.lang.Process proc = Runtime.getRuntime().exec(new String[]{"/system/bin/sh"});
             shellSessions.put(sessionId, proc.getOutputStream());
+
+            // Drain stderr so the process never blocks on a full stderr pipe
+            new Thread(() -> {
+                try { proc.getErrorStream().transferTo(OutputStream.nullOutputStream()); } catch (Exception ignored) {}
+            }, "mdm-shell-err-" + sessionId).start();
+
             // Relay stdout back to server in chunks
             new Thread(() -> {
                 byte[] buf = new byte[4096];
@@ -312,10 +348,10 @@ public class MdmService extends Service {
                 } finally {
                     shellSessions.remove(sessionId);
                     try {
-                        JSONObject closed = new JSONObject();
-                        closed.put("type", "shell_closed");
-                        closed.put("session_id", sessionId);
-                        wsClient.send(closed.toString());
+                        JSONObject exit = new JSONObject();
+                        exit.put("type", "shell_exit");   // must match server HandleDeviceMessage
+                        exit.put("session_id", sessionId);
+                        wsClient.send(exit.toString());
                     } catch (Exception ignored) {}
                 }
             }, "mdm-shell-out-" + sessionId).start();
@@ -331,7 +367,9 @@ public class MdmService extends Service {
             return;
         }
         try {
-            stdin.write(data.getBytes(StandardCharsets.UTF_8));
+            // xterm.js sends \r for Enter; without a PTY the shell only recognises \n
+            String normalized = data.replace("\r", "\n");
+            stdin.write(normalized.getBytes(StandardCharsets.UTF_8));
             stdin.flush();
         } catch (Exception e) {
             Log.w(TAG, "shell_stdin write error: " + e.getMessage());
