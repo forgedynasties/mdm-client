@@ -123,7 +123,9 @@ public class MdmApiService {
 
     /**
      * POST /api/v1/ota/status
-     * Reports OTA progress. status = "downloaded" | "installed" | "error"
+     * Reports OTA milestone transitions: "downloaded" | "installed" | "error".
+     * Incremental download progress is sent via WebSocket (ota_progress frames)
+     * and included in the check-in extra payload.
      * errorCode is only included for status="error".
      */
     public void postOtaStatus(String serialNumber, String commandId, String status, String errorCode) {

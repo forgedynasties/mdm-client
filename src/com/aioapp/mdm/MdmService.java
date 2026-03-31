@@ -44,6 +44,7 @@ public class MdmService extends Service {
     private volatile boolean polling = false;
     private volatile boolean remoteConfigLoaded = false;
     private OtaUpdateManager otaUpdateManager;
+    private volatile String otaCommandId;  // set while an OTA is in progress
     private MdmWebSocketClient wsClient;
     private JSONArray cachedInstalledApps = null;
     private BroadcastReceiver packageChangeReceiver;
@@ -285,15 +286,33 @@ public class MdmService extends Service {
                 }
                 final String otaCmdId = cmdId;
                 final String otaSerial = serialNumber;
+                otaCommandId = otaCmdId;
                 otaUpdateManager = new OtaUpdateManager();
                 otaUpdateManager.setListener(new OtaUpdateManager.Listener() {
+                    @Override public void onDownloadProgress(String phase, int percent) {
+                        // Send real-time progress via WebSocket
+                        if (wsClient != null) {
+                            try {
+                                JSONObject frame = new JSONObject();
+                                frame.put("type", "ota_progress");
+                                frame.put("command_id", otaCmdId);
+                                frame.put("phase", phase);
+                                frame.put("percent", percent);
+                                wsClient.send(frame.toString());
+                            } catch (JSONException e) {
+                                Log.e(TAG, "Failed to send OTA progress frame: " + e.getMessage());
+                            }
+                        }
+                    }
                     @Override public void onDownloadComplete() {
                         new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "downloaded", null)).start();
                     }
                     @Override public void onInstallComplete() {
+                        otaCommandId = null;
                         new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "installed", null)).start();
                     }
                     @Override public void onError(String errorCode) {
+                        otaCommandId = null;
                         new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "error", errorCode)).start();
                     }
                 });
@@ -452,6 +471,16 @@ public class MdmService extends Service {
         extra.put("ram_usage_mb", getRamUsageMb());
         extra.put("timezone", java.util.TimeZone.getDefault().getID());
         extra.put("battery_temp_c", extractBatteryTemperature(batteryIntent));
+
+        // Include OTA progress if an update is in progress
+        if (otaUpdateManager != null && otaUpdateManager.isActive() && otaCommandId != null) {
+            JSONObject otaProgress = new JSONObject();
+            otaProgress.put("command_id", otaCommandId);
+            otaProgress.put("phase", otaUpdateManager.getCurrentPhase());
+            otaProgress.put("percent", otaUpdateManager.getCurrentPercent());
+            extra.put("ota_progress", otaProgress);
+        }
+
         payload.put("extra", extra);
 
         payload.put("installed_apps", getCachedInstalledApps());
