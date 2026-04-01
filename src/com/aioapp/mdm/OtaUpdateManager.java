@@ -7,6 +7,9 @@ import android.util.Log;
 /**
  * Wraps Android UpdateEngine for A/B (seamless) OTA updates.
  * Driven by the MDM checkin "ota" command — no separate update check needed.
+ *
+ * Uses a single UpdateEngine instance and guards callbacks with a generation
+ * counter so stale callbacks from previous bind() calls are silently ignored.
  */
 public class OtaUpdateManager {
     private static final String TAG = "OtaUpdateManager";
@@ -27,6 +30,11 @@ public class OtaUpdateManager {
     private volatile int lastReportedPercent = -1;
     private volatile int lastReportedStatus = -1;
 
+    // Monotonically increasing generation — each startUpdate() bumps it.
+    // Callbacks check their captured generation against the current one
+    // so stale callbacks from a previous bind() are silently dropped.
+    private volatile int generation = 0;
+
     // Readable state for check-in payload
     private volatile String currentPhase = "idle";
     private volatile int currentPercent = 0;
@@ -44,12 +52,37 @@ public class OtaUpdateManager {
     public String getCurrentPhase() { return currentPhase; }
     public int getCurrentPercent() { return currentPercent; }
 
+    /** Cancel any in-progress update and detach the callback. */
+    public void cancel() {
+        generation++; // invalidate any outstanding callbacks
+        active = false;
+        currentPhase = "idle";
+        currentPercent = 0;
+        try {
+            updateEngine.cancel();
+        } catch (Exception e) {
+            Log.w(TAG, "cancel: " + e.getMessage());
+        }
+        try {
+            updateEngine.unbind();
+        } catch (Exception e) {
+            Log.w(TAG, "unbind: " + e.getMessage());
+        }
+    }
+
     /**
      * Passes the payload URL and metadata directly to UpdateEngine.
      * url must be a valid http(s):// or file:// URI — passed through as-is.
+     *
+     * If a previous update is in progress, it is cancelled first.
      */
     public void startUpdate(String url, long offset, long size, String[] headers) {
         Log.i(TAG, "startUpdate url=" + url + " offset=" + offset + " size=" + size);
+
+        // Cancel previous update and invalidate old callbacks
+        cancel();
+
+        final int myGeneration = ++generation;
         downloadedReported = false;
         lastReportedPercent = -1;
         lastReportedStatus = -1;
@@ -60,6 +93,7 @@ public class OtaUpdateManager {
         UpdateEngineCallback callback = new UpdateEngineCallback() {
             @Override
             public void onStatusUpdate(int status, float percent) {
+                if (myGeneration != generation) return; // stale callback
                 int pct = Math.round(percent * 100);
                 Log.d(TAG, "status=" + status + " progress=" + pct + "%");
 
@@ -103,6 +137,7 @@ public class OtaUpdateManager {
 
             @Override
             public void onPayloadApplicationComplete(int errorCode) {
+                if (myGeneration != generation) return; // stale callback
                 Log.i(TAG, "onPayloadApplicationComplete errorCode=" + errorCode);
                 active = false;
                 currentPhase = "idle";

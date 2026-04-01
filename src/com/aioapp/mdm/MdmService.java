@@ -286,8 +286,14 @@ public class MdmService extends Service {
                 }
                 final String otaCmdId = cmdId;
                 final String otaSerial = serialNumber;
+                // Cancel any previous OTA before starting a new one
+                if (otaUpdateManager != null) {
+                    otaUpdateManager.cancel();
+                }
                 otaCommandId = otaCmdId;
-                otaUpdateManager = new OtaUpdateManager();
+                if (otaUpdateManager == null) {
+                    otaUpdateManager = new OtaUpdateManager();
+                }
                 otaUpdateManager.setListener(new OtaUpdateManager.Listener() {
                     @Override public void onDownloadProgress(String phase, int percent) {
                         // Send real-time progress via WebSocket
