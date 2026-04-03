@@ -292,7 +292,7 @@ public class MdmService extends Service {
                 }
                 otaCommandId = otaCmdId;
                 if (otaUpdateManager == null) {
-                    otaUpdateManager = new OtaUpdateManager();
+                    otaUpdateManager = new OtaUpdateManager(this);
                 }
                 otaUpdateManager.setListener(new OtaUpdateManager.Listener() {
                     @Override public void onDownloadProgress(String phase, int percent) {
