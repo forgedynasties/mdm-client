@@ -382,6 +382,15 @@ public class MdmService extends Service {
             }
             Log.i(TAG, "APK downloaded to " + apkFile.getAbsolutePath());
 
+            // Extract package name from APK for fallback verification
+            String apkPackageName = null;
+            android.content.pm.PackageInfo apkInfo = getPackageManager().getPackageArchiveInfo(
+                    apkFile.getAbsolutePath(), 0);
+            if (apkInfo != null) {
+                apkPackageName = apkInfo.packageName;
+                Log.i(TAG, "APK package: " + apkPackageName);
+            }
+
             // Install via PackageInstaller API
             PackageInstaller installer = getPackageManager().getPackageInstaller();
             PackageInstaller.SessionParams params = new PackageInstaller.SessionParams(
@@ -429,9 +438,24 @@ public class MdmService extends Service {
                 session.commit(pi.getIntentSender());
             }
 
-            latch.await(60, TimeUnit.SECONDS);
+            boolean completed = latch.await(180, TimeUnit.SECONDS);
             unregisterReceiver(resultReceiver);
-            return success.get();
+
+            if (success.get()) return true;
+
+            // Fallback: if timed out or callback reported failure, check if the package is actually installed
+            if (apkPackageName != null) {
+                try {
+                    getPackageManager().getPackageInfo(apkPackageName, 0);
+                    Log.i(TAG, "APK package " + apkPackageName + " is installed (verified via PackageManager"
+                            + (completed ? " after callback reported failure)" : " after timeout)"));
+                    return true;
+                } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+                    Log.e(TAG, "APK package " + apkPackageName + " not found after install"
+                            + (completed ? " (callback reported failure)" : " (timed out after 180s)"));
+                }
+            }
+            return false;
         } catch (Exception e) {
             Log.e(TAG, "installApk error: " + e.getMessage());
             return false;
