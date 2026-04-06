@@ -111,8 +111,8 @@ public class OtaUpdateManager {
     // Start update — full ota-app flow
     // ----------------------------------------------------------------
 
-    public void startUpdate(String url, long offset, long size, String[] headers) {
-        Log.i(TAG, "startUpdate url=" + url + " offset=" + offset + " size=" + size);
+    public void startUpdate(String url) {
+        Log.i(TAG, "startUpdate url=" + url);
 
         // Duplicate guard
         if (isUpdatePendingReboot()) {
@@ -147,14 +147,23 @@ public class OtaUpdateManager {
                 if (!finalFile.exists()) throw new IOException("OTA file missing after move");
                 if (myGen != generation) return;
 
-                // 3. Notify download complete
+                // 3. Parse the ZIP to extract payload offset, size, and properties
+                currentPhase = "parsing";
+                UpdateParser.ParsedUpdate parsed = UpdateParser.parse(finalFile);
+                if (parsed == null || !parsed.isValid()) {
+                    throw new IOException("Failed to parse OTA ZIP: " + parsed);
+                }
+                Log.i(TAG, "Parsed OTA: " + parsed);
+                if (myGen != generation) return;
+
+                // 4. Notify download complete
                 if (listener != null) listener.onDownloadComplete();
 
                 handedOff = true;
 
-                // 4. Hand off to UpdateEngine
+                // 5. Hand off to UpdateEngine with parsed values
                 applyViaUpdateEngine(
-                        "file://" + OTA_PACKAGE_PATH, offset, size, headers, myGen);
+                        parsed.mUrl, parsed.mOffset, parsed.mSize, parsed.mProps, myGen);
 
             } catch (Exception e) {
                 if (myGen == generation) {

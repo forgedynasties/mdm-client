@@ -277,13 +277,6 @@ public class MdmService extends Service {
             }
             case "ota": {
                 String updateUrl = payload.optString("update_url", "");
-                long payloadOffset = payload.optLong("payload_offset", 0);
-                long payloadSize = payload.optLong("payload_size", 0);
-                JSONArray headersArr = payload.optJSONArray("payload_headers");
-                String[] headers = new String[headersArr != null ? headersArr.length() : 0];
-                if (headersArr != null) {
-                    for (int j = 0; j < headersArr.length(); j++) headers[j] = headersArr.getString(j);
-                }
                 final String otaCmdId = cmdId;
                 final String otaSerial = serialNumber;
                 // Cancel any previous OTA before starting a new one
@@ -322,7 +315,7 @@ public class MdmService extends Service {
                         new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "error", errorCode)).start();
                     }
                 });
-                otaUpdateManager.startUpdate(updateUrl, payloadOffset, payloadSize, headers);
+                otaUpdateManager.startUpdate(updateUrl);
                 break;
             }
             default:
