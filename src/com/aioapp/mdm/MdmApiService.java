@@ -17,7 +17,7 @@ public class MdmApiService {
     private static final String DISCOVERY_URL = "https://ota-update-packages.s3.us-west-2.amazonaws.com/mdm-config.json";
 
     // Fallback used when DISCOVERY_URL is empty or unreachable
-    private static final String DEFAULT_API_BASE_URL = "http://10.32.0.246:8080";
+    private static final String DEFAULT_API_BASE_URL = "http://10.32.1.170:8080";
 
     // When true, always use DEFAULT_API_BASE_URL and skip the remote config fetch.
     private static final boolean USE_HARDCODED_API_URL = false;
