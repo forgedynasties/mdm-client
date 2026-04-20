@@ -147,6 +147,8 @@ public class MdmService extends Service {
                     JSONObject config = response.optJSONObject("config");
                     if (config != null) {
                         KioskManager.applyAndSave(MdmService.this, dpm, adminComponent, config);
+                        long secs = config.optLong("checkin_interval_seconds", 0);
+                        if (secs >= 10) apiService.setPollInterval(secs * 1000L);
                     }
                 } else {
                     Log.w(TAG, "Checkin failed, reloading remote config");
