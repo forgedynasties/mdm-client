@@ -1,5 +1,6 @@
 package com.aioapp.mdm;
 
+import android.os.SystemProperties;
 import android.util.Log;
 import org.json.JSONObject;
 import java.io.BufferedReader;
@@ -12,15 +13,7 @@ import java.nio.charset.StandardCharsets;
 public class MdmApiService {
     private static final String TAG = "MdmApiService";
 
-    // Permanent config URL — this never changes.
-    // It returns a JSON body with "api_base_url" so the actual server address can be updated remotely.
-    private static final String DISCOVERY_URL = "https://ota-update-packages.s3.us-west-2.amazonaws.com/mdm-config.json";
-
-    // Fallback used when DISCOVERY_URL is empty or unreachable
-    private static final String DEFAULT_API_BASE_URL = "http://10.32.1.170:8080";
-
-    // When true, always use DEFAULT_API_BASE_URL and skip the remote config fetch.
-    private static final boolean USE_HARDCODED_API_URL = false;
+    private static final String DEFAULT_API_BASE_URL = "https://udm.dev.aioapp.com";
 
     // Shared API key — must match DEVICE_API_KEY in server .env
     static final String API_KEY = "your-secret-key-here";
@@ -43,36 +36,11 @@ public class MdmApiService {
         return Math.min((long) Math.pow(2, consecutiveFailures), 16);
     }
 
-    /**
-     * Fetches config from DISCOVERY_URL.
-     * Expected response: { "api_base_url": "http://..." }
-     * Falls back to defaults if DISCOVERY_URL is empty or the request fails.
-     */
     public void loadRemoteConfig() {
-        if (USE_HARDCODED_API_URL) {
-            Log.i(TAG, "USE_HARDCODED_API_URL=true, skipping discovery: apiBaseUrl=" + apiBaseUrl);
-            return;
-        }
-        if (DISCOVERY_URL.isEmpty()) {
-            Log.i(TAG, "No DISCOVERY_URL set, using defaults: apiBaseUrl=" + apiBaseUrl);
-            return;
-        }
-        try {
-            URL url = new URL(DISCOVERY_URL);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(5_000);
-            conn.setReadTimeout(5_000);
-            try (BufferedReader br = new BufferedReader(
-                    new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
-                StringBuilder sb = new StringBuilder();
-                String line;
-                while ((line = br.readLine()) != null) sb.append(line);
-                JSONObject cfg = new JSONObject(sb.toString());
-                if (cfg.has("api_base_url")) apiBaseUrl = cfg.getString("api_base_url");
-            }
-            Log.i(TAG, "Remote config loaded: apiBaseUrl=" + apiBaseUrl);
-        } catch (Exception e) {
-            Log.w(TAG, "Remote config fetch failed, using defaults: " + e.getMessage());
+        String propUrl = SystemProperties.get("persist.mdm.api.url", "");
+        if (!propUrl.isEmpty()) {
+            apiBaseUrl = propUrl;
+            Log.i(TAG, "Using persist.mdm.api.url override: apiBaseUrl=" + apiBaseUrl);
         }
     }
 
