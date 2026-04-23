@@ -15,6 +15,8 @@ import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.security.SecureRandom;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
 
 public class MdmWebSocketClient {
     private static final String TAG = "MdmWebSocketClient";
@@ -30,6 +32,7 @@ public class MdmWebSocketClient {
 
     private final String host;
     private final int port;
+    private final boolean useTls;
     private final String wsPath; // e.g. /api/v1/ws?serial=DEVICE-001
     private final String apiKey;
 
@@ -49,8 +52,9 @@ public class MdmWebSocketClient {
         try {
             URL url = new URL(apiBaseUrl);
             this.host = url.getHost();
+            this.useTls = url.getProtocol().equalsIgnoreCase("https");
             int p = url.getPort();
-            this.port = (p == -1) ? 80 : p;
+            this.port = (p == -1) ? (this.useTls ? 443 : 80) : p;
             this.wsPath = "/api/v1/ws?serial=" + URLEncoder.encode(serial, "UTF-8");
         } catch (Exception e) {
             throw new IllegalArgumentException("Invalid apiBaseUrl: " + apiBaseUrl, e);
@@ -96,8 +100,16 @@ public class MdmWebSocketClient {
     }
 
     private void connect() throws Exception {
-        Socket s = new Socket();
-        s.connect(new InetSocketAddress(host, port), 10_000);
+        Socket s;
+        if (useTls) {
+            SSLSocket ssl = (SSLSocket) SSLSocketFactory.getDefault().createSocket();
+            ssl.connect(new InetSocketAddress(host, port), 10_000);
+            ssl.startHandshake();
+            s = ssl;
+        } else {
+            s = new Socket();
+            s.connect(new InetSocketAddress(host, port), 10_000);
+        }
         s.setSoTimeout(90_000); // > 2× server ping interval (45s)
         this.socket = s;
         OutputStream out = s.getOutputStream();

@@ -13,6 +13,8 @@ import java.nio.charset.StandardCharsets;
 public class MdmApiService {
     private static final String TAG = "MdmApiService";
 
+    private static final boolean USE_LOCAL_SERVER = true;
+    private static final String LOCAL_API_BASE_URL = "http://10.32.1.170:8080";
     private static final String DEFAULT_API_BASE_URL = "https://udm.dev.aioapp.com";
 
     // Shared API key — must match DEVICE_API_KEY in server .env
@@ -20,7 +22,7 @@ public class MdmApiService {
 
     private static final long DEFAULT_POLL_INTERVAL_MS = 30_000; // 30 seconds
 
-    private String apiBaseUrl = DEFAULT_API_BASE_URL;
+    private String apiBaseUrl = USE_LOCAL_SERVER ? LOCAL_API_BASE_URL : DEFAULT_API_BASE_URL;
     private long pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
     private int consecutiveFailures = 0;
 
