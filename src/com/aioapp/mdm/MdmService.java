@@ -24,10 +24,13 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.zip.CRC32;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -40,7 +43,11 @@ public class MdmService extends Service {
     private static final String CHANNEL_ID = "MDM_SERVICE";
     private static final int NOTIFICATION_ID = 1001;
 
-    private Handler mainHandler;
+    private static final String POLL_ACTION = "com.aioapp.mdm.POLL";
+
+    private AlarmManager alarmManager;
+    private PendingIntent pollIntent;
+    private BroadcastReceiver pollReceiver;
     private MdmApiService apiService;
     private ConnectivityManager connectivityManager;
     private ConnectivityManager.NetworkCallback networkCallback;
@@ -56,6 +63,31 @@ public class MdmService extends Service {
     private BroadcastReceiver packageChangeReceiver;
     private String lastNotificationText = "";
     private ExecutorService executor;
+
+    // Battery: registered once in onCreate, updated via sticky broadcast
+    private volatile Intent cachedBatteryIntent = null;
+    private BroadcastReceiver batteryReceiver;
+
+    // Per-field system query caches
+    private double cachedStorageFreeGb = 0;
+    private long storageLastMs = 0;
+    private static final long STORAGE_CACHE_MS = 120_000;
+
+    private JSONObject cachedWifiExtra = null;
+    private long wifiLastMs = 0;
+    private static final long WIFI_CACHE_MS = 300_000;
+
+    private JSONObject cachedRam = null;
+    private long ramLastMs = 0;
+    private static final long RAM_CACHE_MS = 30_000;
+
+    private int cachedWlcStatus = -1;
+    private long wlcLastMs = 0;
+    private static final long WLC_CACHE_MS = 60_000;
+
+    // App list delta
+    private String lastAppsHash = null;
+    private volatile boolean sendFullAppList = false;
 
     private static final Set<String> ALLOWED_SHELL_COMMANDS = new HashSet<>(Arrays.asList(
             "ls", "cat", "echo", "ps", "df", "uptime", "date", "id",
@@ -74,40 +106,55 @@ public class MdmService extends Service {
         return ALLOWED_SHELL_COMMANDS.contains(firstWord);
     }
 
-    private final Runnable pollRunnable = new Runnable() {
-        @Override
-        public void run() {
-            if (networkAvailable && !polling) {
-                performCheckin();
-            }
-            mainHandler.postDelayed(this, getAdaptivePollInterval() * apiService.getBackoffMultiplier());
-        }
-    };
-
     @Override
     public void onCreate() {
         super.onCreate();
-        mainHandler = new Handler(Looper.getMainLooper());
         executor = new ThreadPoolExecutor(2, 4, 60, TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(16), new ThreadPoolExecutor.DiscardOldestPolicy());
-        apiService = new MdmApiService(this);
+        apiService = new MdmApiService();
         connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
         adminComponent = new ComponentName(this, MdmAdminReceiver.class);
         ensureDeviceOwner();
         createNotificationChannel();
         startForeground(NOTIFICATION_ID, buildNotification("MDM service running"));
+        batteryReceiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context context, Intent intent) {
+                cachedBatteryIntent = intent;
+            }
+        };
+        cachedBatteryIntent = registerReceiver(batteryReceiver,
+                new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+
+        alarmManager = getSystemService(AlarmManager.class);
+        pollReceiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context context, Intent intent) {
+                if (networkAvailable && !polling) performCheckin();
+                scheduleNextPoll();
+            }
+        };
+        registerReceiver(pollReceiver, new IntentFilter(POLL_ACTION), Context.RECEIVER_NOT_EXPORTED);
+        pollIntent = PendingIntent.getBroadcast(this, 0,
+                new Intent(POLL_ACTION).setPackage(getPackageName()), PendingIntent.FLAG_IMMUTABLE);
+
         registerNetworkCallback();
         registerPackageChangeReceiver();
     }
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        // removeCallbacks prevents duplicate loops when onStartCommand is called
-        // multiple times (LOCKED_BOOT_COMPLETED + BOOT_COMPLETED both fire on fresh boot)
-        mainHandler.removeCallbacks(pollRunnable);
-        mainHandler.post(pollRunnable);
+        // Cancel any existing alarm before rescheduling — prevents duplicates when
+        // LOCKED_BOOT_COMPLETED + BOOT_COMPLETED both fire on a fresh boot.
+        alarmManager.cancel(pollIntent);
+        if (networkAvailable && !polling) performCheckin();
+        scheduleNextPoll();
         return START_STICKY;
+    }
+
+    private void scheduleNextPoll() {
+        long intervalMs = getAdaptivePollInterval() * apiService.getBackoffMultiplier();
+        alarmManager.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                SystemClock.elapsedRealtime() + intervalMs, pollIntent);
     }
 
     private void ensureDeviceOwner() {
@@ -170,6 +217,7 @@ public class MdmService extends Service {
                 JSONObject payload = buildCheckinPayload();
                 JSONObject response = apiService.checkin(payload);
                 if (response != null) {
+                    if (response.optBoolean("send_apps", false)) sendFullAppList = true;
                     JSONObject config = response.optJSONObject("config");
                     if (config != null) {
                         KioskManager.applyAndSave(MdmService.this, dpm, adminComponent, config);
@@ -373,17 +421,34 @@ public class MdmService extends Service {
 
         Log.d(TAG, "Logcat cmd: " + java.util.Arrays.toString(cmd));
 
+        final int MAX_LOGCAT_BYTES = 5 * 1024 * 1024;
         java.lang.Process process = Runtime.getRuntime().exec(cmd);
-        String content;
-        try (InputStream is = process.getInputStream();
-             InputStream es = process.getErrorStream()) {
-            content = new String(is.readAllBytes(), StandardCharsets.UTF_8);
-            String stderr = new String(es.readAllBytes(), StandardCharsets.UTF_8);
-            if (!stderr.isEmpty()) Log.w(TAG, "Logcat stderr: " + stderr);
-        }
-        process.waitFor();
-        Log.d(TAG, "Logcat result: " + content.length() + " bytes");
+        // Drain stderr in background — prevents the process blocking on a full stderr pipe
+        Thread stderrDrain = new Thread(() -> {
+            try { process.getErrorStream().transferTo(OutputStream.nullOutputStream()); }
+            catch (Exception ignored) {}
+        });
+        stderrDrain.start();
 
+        StringBuilder sb = new StringBuilder();
+        try (InputStream is = process.getInputStream()) {
+            byte[] buf = new byte[65536];
+            int n, total = 0;
+            while ((n = is.read(buf)) != -1) {
+                sb.append(new String(buf, 0, n, StandardCharsets.UTF_8));
+                total += n;
+                if (total >= MAX_LOGCAT_BYTES) {
+                    sb.append("\n[truncated — exceeded 5 MB limit]");
+                    break;
+                }
+            }
+        }
+        process.destroy();
+        process.waitFor();
+        stderrDrain.join();
+
+        String content = sb.toString();
+        Log.d(TAG, "Logcat result: " + content.length() + " bytes");
         apiService.postLogcat(getDeviceSerial(), requestId, content);
     }
 
@@ -539,7 +604,15 @@ public class MdmService extends Service {
 
         payload.put("extra", extra);
 
-        payload.put("installed_apps", getCachedInstalledApps());
+        // Send full app list only when packages changed or server explicitly requests it
+        JSONArray apps = getCachedInstalledApps();
+        String currentHash = computeAppsHash(apps);
+        if (sendFullAppList || !currentHash.equals(lastAppsHash)) {
+            payload.put("installed_apps", apps);
+            lastAppsHash = currentHash;
+            sendFullAppList = false;
+        }
+        payload.put("apps_hash", currentHash);
 
         return payload;
     }
@@ -553,7 +626,7 @@ public class MdmService extends Service {
     }
 
     private Intent getBatteryIntent() {
-        return registerReceiver(null, new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+        return cachedBatteryIntent;
     }
 
     private int extractBatteryPct(Intent batteryStatus) {
@@ -571,52 +644,71 @@ public class MdmService extends Service {
     }
 
     private void populateWifiInfo(JSONObject extra) throws JSONException {
+        long now = SystemClock.elapsedRealtime();
+        if (cachedWifiExtra != null && now - wifiLastMs < WIFI_CACHE_MS) {
+            extra.put("ip_address", cachedWifiExtra.opt("ip_address"));
+            extra.put("wifi", cachedWifiExtra.opt("wifi"));
+            return;
+        }
+        cachedWifiExtra = new JSONObject();
         WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
         if (wm == null || !wm.isWifiEnabled()) {
-            extra.put("ip_address", JSONObject.NULL);
-            extra.put("wifi", JSONObject.NULL);
-            return;
+            cachedWifiExtra.put("ip_address", JSONObject.NULL);
+            cachedWifiExtra.put("wifi", JSONObject.NULL);
+        } else {
+            WifiInfo info = wm.getConnectionInfo();
+            if (info == null) {
+                cachedWifiExtra.put("ip_address", JSONObject.NULL);
+                cachedWifiExtra.put("wifi", JSONObject.NULL);
+            } else {
+                int ip4 = info.getIpAddress();
+                cachedWifiExtra.put("ip_address", String.format("%d.%d.%d.%d",
+                        ip4 & 0xff, (ip4 >> 8) & 0xff, (ip4 >> 16) & 0xff, (ip4 >> 24) & 0xff));
+                cachedWifiExtra.put("wifi", info.getSSID());
+            }
         }
-        WifiInfo info = wm.getConnectionInfo();
-        if (info == null) {
-            extra.put("ip_address", JSONObject.NULL);
-            extra.put("wifi", JSONObject.NULL);
-            return;
-        }
-        int ip4 = info.getIpAddress();
-        extra.put("ip_address", String.format("%d.%d.%d.%d",
-                ip4 & 0xff, (ip4 >> 8) & 0xff, (ip4 >> 16) & 0xff, (ip4 >> 24) & 0xff));
-        extra.put("wifi", info.getSSID());
+        wifiLastMs = now;
+        extra.put("ip_address", cachedWifiExtra.opt("ip_address"));
+        extra.put("wifi", cachedWifiExtra.opt("wifi"));
     }
 
     private JSONObject getRamUsageMb() throws JSONException {
+        long now = SystemClock.elapsedRealtime();
+        if (cachedRam != null && now - ramLastMs < RAM_CACHE_MS) return cachedRam;
         android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
         android.app.ActivityManager.MemoryInfo mi = new android.app.ActivityManager.MemoryInfo();
         am.getMemoryInfo(mi);
-        JSONObject ram = new JSONObject();
-        ram.put("total", mi.totalMem / (1024 * 1024));
-        ram.put("available", mi.availMem / (1024 * 1024));
-        ram.put("used", (mi.totalMem - mi.availMem) / (1024 * 1024));
-        return ram;
+        cachedRam = new JSONObject();
+        cachedRam.put("total", mi.totalMem / (1024 * 1024));
+        cachedRam.put("available", mi.availMem / (1024 * 1024));
+        cachedRam.put("used", (mi.totalMem - mi.availMem) / (1024 * 1024));
+        ramLastMs = now;
+        return cachedRam;
     }
 
     private int getWlcStatus() {
+        long now = SystemClock.elapsedRealtime();
+        if (wlcLastMs > 0 && now - wlcLastMs < WLC_CACHE_MS) return cachedWlcStatus;
         final String gpioPath = "/sys/devices/platform/soc/soc:customer_gpio/gpio27";
         try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(gpioPath))) {
             String val = reader.readLine();
-            if (val == null) return -1;
-            return val.trim().equals("0") ? 0 : 1;
+            cachedWlcStatus = (val == null) ? -1 : (val.trim().equals("0") ? 0 : 1);
         } catch (Exception e) {
             Log.e(TAG, "getWlcStatus error: " + e.getMessage());
-            return -1;
+            cachedWlcStatus = -1;
         }
+        wlcLastMs = now;
+        return cachedWlcStatus;
     }
 
     private double getStorageFreeGb() {
+        long now = SystemClock.elapsedRealtime();
+        if (storageLastMs > 0 && now - storageLastMs < STORAGE_CACHE_MS) return cachedStorageFreeGb;
         StatFs stat = new StatFs(Environment.getDataDirectory().getPath());
         long bytesAvailable = stat.getAvailableBlocksLong() * stat.getBlockSizeLong();
-        double gb = bytesAvailable / (1024.0 * 1024.0 * 1024.0);
-        return Math.round(gb * 10.0) / 10.0;
+        cachedStorageFreeGb = Math.round(bytesAvailable / (1024.0 * 1024.0 * 1024.0) * 10.0) / 10.0;
+        storageLastMs = now;
+        return cachedStorageFreeGb;
     }
 
     private void registerPackageChangeReceiver() {
@@ -640,6 +732,20 @@ public class MdmService extends Service {
             cachedInstalledApps = getInstalledApps();
         }
         return cachedInstalledApps;
+    }
+
+    private String computeAppsHash(JSONArray apps) {
+        List<String> packages = new ArrayList<>(apps.length());
+        for (int i = 0; i < apps.length(); i++) {
+            JSONObject app = apps.optJSONObject(i);
+            if (app != null) packages.add(app.optString("package", ""));
+        }
+        Collections.sort(packages);
+        CRC32 crc = new CRC32();
+        for (String pkg : packages) {
+            crc.update(pkg.getBytes(StandardCharsets.UTF_8));
+        }
+        return Long.toHexString(crc.getValue());
     }
 
     private long getAdaptivePollInterval() {
@@ -681,7 +787,10 @@ public class MdmService extends Service {
 
     @Override
     public void onDestroy() {
-        mainHandler.removeCallbacks(pollRunnable);
+        alarmManager.cancel(pollIntent);
+        if (pollReceiver != null) {
+            try { unregisterReceiver(pollReceiver); } catch (Exception ignored) {}
+        }
         executor.shutdownNow();
         if (wsClient != null) wsClient.stop();
         if (networkCallback != null) {
@@ -689,6 +798,9 @@ public class MdmService extends Service {
         }
         if (packageChangeReceiver != null) {
             try { unregisterReceiver(packageChangeReceiver); } catch (Exception ignored) {}
+        }
+        if (batteryReceiver != null) {
+            try { unregisterReceiver(batteryReceiver); } catch (Exception ignored) {}
         }
         super.onDestroy();
     }
