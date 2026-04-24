@@ -335,12 +335,16 @@ public class MdmService extends Service {
                     java.lang.Process p = Runtime.getRuntime().exec(
                             new String[]{"screencap", "-p", tmp.getAbsolutePath()});
                     p.waitFor();
-                    byte[] bytes;
-                    try (FileInputStream fis = new FileInputStream(tmp)) {
-                        bytes = fis.readAllBytes();
+                    // Stream-encode to base64 in 8 KB chunks — raw PNG bytes never fully in heap
+                    java.io.ByteArrayOutputStream b64Buf = new java.io.ByteArrayOutputStream();
+                    try (FileInputStream fis = new FileInputStream(tmp);
+                         OutputStream enc = java.util.Base64.getEncoder().wrap(b64Buf)) {
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = fis.read(buf)) != -1) enc.write(buf, 0, n);
                     }
-                    String b64 = android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP);
-                    apiService.ackCommand(cmdId, serialNumber, "completed", b64);
+                    apiService.ackCommand(cmdId, serialNumber, "completed",
+                            b64Buf.toString(StandardCharsets.UTF_8.name()));
                 } finally {
                     tmp.delete();
                 }
@@ -514,23 +518,25 @@ public class MdmService extends Service {
 
             String action = "com.aioapp.mdm.INSTALL_RESULT_" + System.currentTimeMillis();
             registerReceiver(resultReceiver, new IntentFilter(action), Context.RECEIVER_NOT_EXPORTED);
-
-            int sessionId = installer.createSession(params);
-            try (PackageInstaller.Session session = installer.openSession(sessionId)) {
-                try (InputStream in = new java.io.FileInputStream(apkFile);
-                     OutputStream out = session.openWrite("base.apk", 0, apkFile.length())) {
-                    byte[] buf = new byte[8192];
-                    int n;
-                    while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
-                    session.fsync(out);
+            boolean completed;
+            try {
+                int sessionId = installer.createSession(params);
+                try (PackageInstaller.Session session = installer.openSession(sessionId)) {
+                    try (InputStream in = new java.io.FileInputStream(apkFile);
+                         OutputStream out = session.openWrite("base.apk", 0, apkFile.length())) {
+                        byte[] buf = new byte[8192];
+                        int n;
+                        while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+                        session.fsync(out);
+                    }
+                    PendingIntent pi = PendingIntent.getBroadcast(this, sessionId,
+                            new Intent(action).setPackage(getPackageName()), PendingIntent.FLAG_IMMUTABLE);
+                    session.commit(pi.getIntentSender());
                 }
-                PendingIntent pi = PendingIntent.getBroadcast(this, sessionId,
-                        new Intent(action).setPackage(getPackageName()), PendingIntent.FLAG_IMMUTABLE);
-                session.commit(pi.getIntentSender());
+                completed = latch.await(180, TimeUnit.SECONDS);
+            } finally {
+                try { unregisterReceiver(resultReceiver); } catch (Exception ignored) {}
             }
-
-            boolean completed = latch.await(180, TimeUnit.SECONDS);
-            unregisterReceiver(resultReceiver);
 
             if (success.get()) return true;
 
@@ -803,6 +809,19 @@ public class MdmService extends Service {
             try { unregisterReceiver(batteryReceiver); } catch (Exception ignored) {}
         }
         super.onDestroy();
+    }
+
+    @Override
+    public void onTaskRemoved(Intent rootIntent) {
+        if (networkCallback != null) {
+            try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) {}
+            networkCallback = null;
+        }
+        if (packageChangeReceiver != null) {
+            try { unregisterReceiver(packageChangeReceiver); } catch (Exception ignored) {}
+            packageChangeReceiver = null;
+        }
+        super.onTaskRemoved(rootIntent);
     }
 
     @Override

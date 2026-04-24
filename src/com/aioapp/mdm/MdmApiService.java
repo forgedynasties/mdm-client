@@ -1,6 +1,5 @@
 package com.aioapp.mdm;
 
-import android.os.SystemProperties;
 import android.util.Log;
 import org.json.JSONObject;
 import java.io.BufferedReader;
@@ -12,7 +11,8 @@ import java.nio.charset.StandardCharsets;
 
 public class MdmApiService {
     private static final String TAG = "MdmApiService";
-    private static final String PROP_API_KEY = "ro.mdm.api.key";
+    // Keep in sync with DEVICE_API_KEY in server .env
+    private static final String API_KEY = "your-secret-key-here";
 
     private static final boolean USE_LOCAL_SERVER = true;
     private static final String LOCAL_API_BASE_URL = "http://10.32.1.170:8080";
@@ -20,22 +20,13 @@ public class MdmApiService {
 
     private static final long DEFAULT_POLL_INTERVAL_MS = 30_000;
 
-    private final String apiKey;
     private String apiBaseUrl = USE_LOCAL_SERVER ? LOCAL_API_BASE_URL : DEFAULT_API_BASE_URL;
     private long pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
     private int consecutiveFailures = 0;
 
-    public MdmApiService() {
-        this.apiKey = loadApiKey();
-    }
+    public MdmApiService() {}
 
-    private String loadApiKey() {
-        String key = SystemProperties.get(PROP_API_KEY, "");
-        if (key.isEmpty()) Log.e(TAG, "ro.mdm.api.key not set in build — check system.prop");
-        return key;
-    }
-
-    public String getApiKey() { return apiKey; }
+    public String getApiKey() { return API_KEY; }
 
     public String getApiBaseUrl() { return apiBaseUrl; }
 
@@ -50,11 +41,7 @@ public class MdmApiService {
     }
 
     public void loadRemoteConfig() {
-        String propUrl = SystemProperties.get("persist.mdm.api.url", "");
-        if (!propUrl.isEmpty()) {
-            apiBaseUrl = propUrl;
-            Log.i(TAG, "Using persist.mdm.api.url override: apiBaseUrl=" + apiBaseUrl);
-        }
+        // URL override can be added here if needed
     }
 
     /**
@@ -152,7 +139,7 @@ public class MdmApiService {
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setRequestMethod("POST");
         conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-        conn.setRequestProperty("X-API-Key", apiKey);
+        conn.setRequestProperty("X-API-Key", API_KEY);
         conn.setDoOutput(true);
         conn.setConnectTimeout(10_000);
         conn.setReadTimeout(30_000);
