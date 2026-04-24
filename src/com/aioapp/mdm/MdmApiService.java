@@ -8,6 +8,7 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.Random;
 
 public class MdmApiService {
     private static final String TAG = "MdmApiService";
@@ -19,6 +20,7 @@ public class MdmApiService {
     private static final String DEFAULT_API_BASE_URL = "https://udm.dev.aioapp.com";
 
     private static final long DEFAULT_POLL_INTERVAL_MS = 30_000;
+    private static final Random JITTER = new Random();
 
     private String apiBaseUrl = USE_LOCAL_SERVER ? LOCAL_API_BASE_URL : DEFAULT_API_BASE_URL;
     private long pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
@@ -46,29 +48,33 @@ public class MdmApiService {
 
     /**
      * POST /api/v1/checkin
-     * Returns the response body as a JSONObject on success, or null on failure.
-     * Tracks consecutive failures for exponential backoff — no blocking retries.
+     * Up to 3 attempts with 500ms + random jitter between tries before counting as a failure.
+     * 401 aborts immediately (no retry). consecutiveFailures only increments after all tries fail.
      */
     public JSONObject checkin(JSONObject payload) {
-        try {
-            PostResult result = doPost("/api/v1/checkin", payload.toString());
-            if (result.code == HttpURLConnection.HTTP_OK) {
-                consecutiveFailures = 0;
-                Log.d(TAG, "Checkin OK");
-                return new JSONObject(result.body);
-            } else if (result.code >= 500) {
-                consecutiveFailures++;
-                Log.w(TAG, "Server error " + result.code + " (failure #" + consecutiveFailures + ") — backing off");
-            } else if (result.code == HttpURLConnection.HTTP_UNAUTHORIZED) {
-                Log.e(TAG, "Checkin 401: invalid API key");
-            } else {
-                consecutiveFailures++;
-                Log.w(TAG, "Checkin unexpected response: " + result.code);
+        for (int attempt = 0; attempt < 3; attempt++) {
+            if (attempt > 0) {
+                try { Thread.sleep(500 + JITTER.nextInt(500)); }
+                catch (InterruptedException ie) { Thread.currentThread().interrupt(); return null; }
             }
-        } catch (Exception e) {
-            consecutiveFailures++;
-            Log.e(TAG, "Checkin failed: " + e.getMessage());
+            try {
+                PostResult result = doPost("/api/v1/checkin", payload.toString());
+                if (result.code == HttpURLConnection.HTTP_OK) {
+                    consecutiveFailures = 0;
+                    Log.d(TAG, "Checkin OK");
+                    return new JSONObject(result.body);
+                }
+                if (result.code == HttpURLConnection.HTTP_UNAUTHORIZED) {
+                    Log.e(TAG, "Checkin 401: invalid API key");
+                    return null;
+                }
+                Log.w(TAG, "Checkin attempt " + (attempt + 1) + " failed: HTTP " + result.code);
+            } catch (Exception e) {
+                Log.w(TAG, "Checkin attempt " + (attempt + 1) + " failed: " + e.getMessage());
+            }
         }
+        consecutiveFailures++;
+        Log.w(TAG, "Checkin failed after retries (failure #" + consecutiveFailures + ") — backing off");
         return null;
     }
 

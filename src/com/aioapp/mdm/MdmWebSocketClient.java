@@ -38,6 +38,7 @@ public class MdmWebSocketClient {
 
     private Listener listener;
     private volatile boolean running = false;
+    private volatile Thread loopThread;
     private volatile Socket socket;
     private volatile OutputStream outputStream;
     private int reconnectAttempt = 0;
@@ -70,11 +71,14 @@ public class MdmWebSocketClient {
         running = true;
         Thread t = new Thread(this::connectLoop, "mdm-ws");
         t.setDaemon(true);
+        loopThread = t;
         t.start();
     }
 
     public void stop() {
         running = false;
+        Thread t = loopThread;
+        if (t != null) t.interrupt();
         closeSocket();
     }
 

@@ -294,10 +294,17 @@ public class MdmService extends Service {
                     break;
                 }
                 java.lang.Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", shellCmd});
-                // Drain stderr in a side thread; collect it in case stdout is empty
+                // Drain stderr in a side thread; cap at 10 MB to prevent OOM
                 ByteArrayOutputStream stderrBuf = new ByteArrayOutputStream();
                 Thread stderrThread = new Thread(() -> {
-                    try { p.getErrorStream().transferTo(stderrBuf); } catch (Exception ignored) {}
+                    try (InputStream es = p.getErrorStream()) {
+                        byte[] buf = new byte[8192];
+                        int n, total = 0;
+                        while ((n = es.read(buf)) != -1) {
+                            if (total < 10 * 1024 * 1024) { stderrBuf.write(buf, 0, n); total += n; }
+                            // keep draining even past cap so process doesn't stall on full pipe
+                        }
+                    } catch (Exception ignored) {}
                 });
                 stderrThread.start();
                 // Stream stdout chunks via WebSocket so the browser sees them immediately
@@ -757,14 +764,19 @@ public class MdmService extends Service {
     private long getAdaptivePollInterval() {
         long base = apiService.getPollInterval();
         Intent battery = getBatteryIntent();
-        if (battery == null) return base;
+        PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
+        boolean interactive = pm == null || pm.isInteractive();
+
+        if (battery == null) return interactive ? base : base * 2;
         int plugged = battery.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
         if (plugged != 0) return base; // charging — use normal interval
+
         int level = battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
         int scale = battery.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
         int pct = (scale > 0 && level >= 0) ? (int) ((level / (float) scale) * 100) : 100;
         if (pct <= 15) return base * 4;  // critical battery: poll 4× less often
         if (pct <= 30) return base * 2;  // low battery: poll 2× less often
+        if (!interactive) return base * 2; // screen off, not charging, not low battery
         return base;
     }
 

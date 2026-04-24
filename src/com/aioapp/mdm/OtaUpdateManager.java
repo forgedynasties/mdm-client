@@ -1,6 +1,8 @@
 package com.aioapp.mdm;
 
 import android.content.Context;
+import android.os.Handler;
+import android.os.Looper;
 import android.os.PowerManager;
 import android.os.UpdateEngine;
 import android.os.UpdateEngineCallback;
@@ -37,6 +39,7 @@ public class OtaUpdateManager {
     private static final String OTA_PACKAGE_PATH = OTA_PACKAGE_DIR + "/update.zip";
     private static final String TEMP_FILE_NAME = "update_temp.zip";
     private static final long WAKE_LOCK_TIMEOUT_MS = 3_600_000L; // 1 hour
+    private static final long WAKE_LOCK_SAFETY_MS  =   30 * 60_000L; // 30 min force-release
 
     public interface Listener {
         void onDownloadProgress(String phase, int percent);
@@ -58,6 +61,7 @@ public class OtaUpdateManager {
     private volatile boolean active = false;
 
     private PowerManager.WakeLock wakeLock;
+    private Handler wakeLockTimer;
 
     public OtaUpdateManager(Context context, Executor executor) {
         this.context = context.getApplicationContext();
@@ -332,9 +336,16 @@ public class OtaUpdateManager {
             wakeLock.acquire(WAKE_LOCK_TIMEOUT_MS);
             Log.i(TAG, "Wake lock acquired (" + WAKE_LOCK_TIMEOUT_MS + "ms)");
         }
+        if (wakeLockTimer == null) wakeLockTimer = new Handler(Looper.getMainLooper());
+        wakeLockTimer.removeCallbacksAndMessages(null);
+        wakeLockTimer.postDelayed(() -> {
+            Log.w(TAG, "Wake lock safety timer fired — force releasing after " + WAKE_LOCK_SAFETY_MS + "ms");
+            releaseWakeLock();
+        }, WAKE_LOCK_SAFETY_MS);
     }
 
     private void releaseWakeLock() {
+        if (wakeLockTimer != null) wakeLockTimer.removeCallbacksAndMessages(null);
         if (wakeLock != null && wakeLock.isHeld()) {
             wakeLock.release();
             Log.i(TAG, "Wake lock released");
