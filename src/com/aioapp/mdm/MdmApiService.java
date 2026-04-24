@@ -2,16 +2,14 @@ package com.aioapp.mdm;
 
 import android.os.SystemProperties;
 import android.util.Log;
-import okhttp3.ConnectionPool;
-import okhttp3.MediaType;
-import okhttp3.OkHttpClient;
-import okhttp3.Request;
-import okhttp3.RequestBody;
-import okhttp3.Response;
 import org.json.JSONObject;
-import java.util.concurrent.TimeUnit;
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
 
-// Requires: implementation "com.squareup.okhttp3:okhttp:4.12.0" in build.gradle
 public class MdmApiService {
     private static final String TAG = "MdmApiService";
     private static final String PROP_API_KEY = "ro.mdm.api.key";
@@ -21,13 +19,6 @@ public class MdmApiService {
     private static final String DEFAULT_API_BASE_URL = "https://udm.dev.aioapp.com";
 
     private static final long DEFAULT_POLL_INTERVAL_MS = 30_000;
-
-    private static final MediaType JSON_MEDIA = MediaType.get("application/json; charset=UTF-8");
-    private static final OkHttpClient HTTP = new OkHttpClient.Builder()
-            .connectionPool(new ConnectionPool(3, 5, TimeUnit.MINUTES))
-            .connectTimeout(10, TimeUnit.SECONDS)
-            .readTimeout(30, TimeUnit.SECONDS)
-            .build();
 
     private final String apiKey;
     private String apiBaseUrl = USE_LOCAL_SERVER ? LOCAL_API_BASE_URL : DEFAULT_API_BASE_URL;
@@ -74,14 +65,14 @@ public class MdmApiService {
     public JSONObject checkin(JSONObject payload) {
         try {
             PostResult result = doPost("/api/v1/checkin", payload.toString());
-            if (result.code == 200) {
+            if (result.code == HttpURLConnection.HTTP_OK) {
                 consecutiveFailures = 0;
                 Log.d(TAG, "Checkin OK");
                 return new JSONObject(result.body);
             } else if (result.code >= 500) {
                 consecutiveFailures++;
                 Log.w(TAG, "Server error " + result.code + " (failure #" + consecutiveFailures + ") — backing off");
-            } else if (result.code == 401) {
+            } else if (result.code == HttpURLConnection.HTTP_UNAUTHORIZED) {
                 Log.e(TAG, "Checkin 401: invalid API key");
             } else {
                 consecutiveFailures++;
@@ -157,14 +148,24 @@ public class MdmApiService {
     }
 
     private PostResult doPost(String endpoint, String jsonBody) throws Exception {
-        Request request = new Request.Builder()
-                .url(apiBaseUrl + endpoint)
-                .addHeader("X-API-Key", apiKey)
-                .post(RequestBody.create(jsonBody, JSON_MEDIA))
-                .build();
-        try (Response response = HTTP.newCall(request).execute()) {
-            String body = response.body() != null ? response.body().string() : "";
-            return new PostResult(response.code(), body);
+        URL url = new URL(apiBaseUrl + endpoint);
+        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        conn.setRequestMethod("POST");
+        conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
+        conn.setRequestProperty("X-API-Key", apiKey);
+        conn.setDoOutput(true);
+        conn.setConnectTimeout(10_000);
+        conn.setReadTimeout(30_000);
+        try (OutputStream os = conn.getOutputStream()) {
+            os.write(jsonBody.getBytes(StandardCharsets.UTF_8));
         }
+        int code = conn.getResponseCode();
+        StringBuilder sb = new StringBuilder();
+        try (BufferedReader br = new BufferedReader(
+                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = br.readLine()) != null) sb.append(line);
+        } catch (Exception ignored) {}
+        return new PostResult(code, sb.toString());
     }
 }
