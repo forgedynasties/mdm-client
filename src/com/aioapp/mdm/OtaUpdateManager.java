@@ -9,7 +9,12 @@ import android.util.Log;
 import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.nio.file.Files;
+import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.attribute.PosixFilePermissions;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 
 /**
@@ -41,6 +46,7 @@ public class OtaUpdateManager {
     }
 
     private final Context context;
+    private final Executor executor;
     private final UpdateEngine updateEngine;
     private Listener listener;
 
@@ -53,8 +59,9 @@ public class OtaUpdateManager {
 
     private PowerManager.WakeLock wakeLock;
 
-    public OtaUpdateManager(Context context) {
+    public OtaUpdateManager(Context context, Executor executor) {
         this.context = context.getApplicationContext();
+        this.executor = executor;
         this.updateEngine = new UpdateEngine();
     }
 
@@ -132,7 +139,7 @@ public class OtaUpdateManager {
 
         acquireWakeLock();
 
-        new Thread(() -> {
+        executor.execute(() -> {
             File tempFile = new File(context.getCacheDir(), TEMP_FILE_NAME);
             boolean handedOff = false;
 
@@ -176,7 +183,7 @@ public class OtaUpdateManager {
             } finally {
                 if (!handedOff) releaseWakeLock();
             }
-        }).start();
+        });
     }
 
     // ----------------------------------------------------------------
@@ -227,14 +234,13 @@ public class OtaUpdateManager {
     // ----------------------------------------------------------------
 
     private void finalizeOtaFile(File downloadedFile) throws Exception {
-        exec("mkdir -p " + OTA_PACKAGE_DIR);
-        exec("mv " + downloadedFile.getAbsolutePath() + " " + OTA_PACKAGE_PATH);
-        exec("chmod 644 " + OTA_PACKAGE_PATH);
-        exec("chown system:cache " + OTA_PACKAGE_PATH);
-    }
-
-    private void exec(String cmd) throws Exception {
-        Runtime.getRuntime().exec(new String[]{"sh", "-c", cmd}).waitFor();
+        Files.createDirectories(Paths.get(OTA_PACKAGE_DIR));
+        Files.move(downloadedFile.toPath(), Paths.get(OTA_PACKAGE_PATH),
+                StandardCopyOption.REPLACE_EXISTING);
+        Files.setPosixFilePermissions(Paths.get(OTA_PACKAGE_PATH),
+                PosixFilePermissions.fromString("rw-r--r--"));
+        // chown requires fixed system UIDs — no user-supplied path interpolation
+        Runtime.getRuntime().exec(new String[]{"chown", "system:cache", OTA_PACKAGE_PATH}).waitFor();
     }
 
     // ----------------------------------------------------------------

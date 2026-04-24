@@ -12,19 +12,30 @@ import java.nio.charset.StandardCharsets;
 
 public class MdmApiService {
     private static final String TAG = "MdmApiService";
+    private static final String PROP_API_KEY = "ro.mdm.api.key";
 
     private static final boolean USE_LOCAL_SERVER = true;
     private static final String LOCAL_API_BASE_URL = "http://10.32.1.170:8080";
     private static final String DEFAULT_API_BASE_URL = "https://udm.dev.aioapp.com";
 
-    // Shared API key — must match DEVICE_API_KEY in server .env
-    static final String API_KEY = "your-secret-key-here";
-
     private static final long DEFAULT_POLL_INTERVAL_MS = 30_000; // 30 seconds
 
+    private final String apiKey;
     private String apiBaseUrl = USE_LOCAL_SERVER ? LOCAL_API_BASE_URL : DEFAULT_API_BASE_URL;
     private long pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
     private int consecutiveFailures = 0;
+
+    public MdmApiService(Context context) {
+        this.apiKey = loadApiKey();
+    }
+
+    private String loadApiKey() {
+        String key = SystemProperties.get(PROP_API_KEY, "");
+        if (key.isEmpty()) Log.e(TAG, "ro.mdm.api.key not set in build — check system.prop");
+        return key;
+    }
+
+    public String getApiKey() { return apiKey; }
 
     public String getApiBaseUrl() { return apiBaseUrl; }
 
@@ -62,7 +73,7 @@ public class MdmApiService {
                 consecutiveFailures++;
                 Log.w(TAG, "Server error " + result.code + " (failure #" + consecutiveFailures + ") — backing off");
             } else if (result.code == HttpURLConnection.HTTP_UNAUTHORIZED) {
-                Log.e(TAG, "Checkin 401: invalid API key — check API_KEY constant");
+                Log.e(TAG, "Checkin 401: invalid API key");
             } else {
                 consecutiveFailures++;
                 Log.w(TAG, "Checkin unexpected response: " + result.code);
@@ -141,7 +152,7 @@ public class MdmApiService {
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setRequestMethod("POST");
         conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-        conn.setRequestProperty("X-API-Key", API_KEY);
+        conn.setRequestProperty("X-API-Key", apiKey);
         conn.setDoOutput(true);
         conn.setConnectTimeout(10_000);
         conn.setReadTimeout(10_000);

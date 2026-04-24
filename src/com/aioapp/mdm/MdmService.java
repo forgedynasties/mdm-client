@@ -24,8 +24,14 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.util.Arrays;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -49,6 +55,24 @@ public class MdmService extends Service {
     private JSONArray cachedInstalledApps = null;
     private BroadcastReceiver packageChangeReceiver;
     private String lastNotificationText = "";
+    private ExecutorService executor;
+
+    private static final Set<String> ALLOWED_SHELL_COMMANDS = new HashSet<>(Arrays.asList(
+            "ls", "cat", "echo", "ps", "df", "uptime", "date", "id",
+            "ip", "netstat", "ifconfig", "ping", "nslookup",
+            "getprop", "setprop", "am", "pm", "wm", "settings",
+            "dumpsys", "logcat", "screencap", "input", "service",
+            "cmd", "stat", "find", "grep", "awk", "sed",
+            "top", "free", "mount", "lsof"
+    ));
+
+    private static boolean isShellCommandAllowed(String cmd) {
+        if (cmd == null || cmd.trim().isEmpty()) return false;
+        String firstWord = cmd.trim().split("\\s+")[0];
+        int slash = firstWord.lastIndexOf('/');
+        if (slash >= 0) firstWord = firstWord.substring(slash + 1);
+        return ALLOWED_SHELL_COMMANDS.contains(firstWord);
+    }
 
     private final Runnable pollRunnable = new Runnable() {
         @Override
@@ -64,7 +88,9 @@ public class MdmService extends Service {
     public void onCreate() {
         super.onCreate();
         mainHandler = new Handler(Looper.getMainLooper());
-        apiService = new MdmApiService();
+        executor = new ThreadPoolExecutor(2, 4, 60, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(16), new ThreadPoolExecutor.DiscardOldestPolicy());
+        apiService = new MdmApiService(this);
         connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
         adminComponent = new ComponentName(this, MdmAdminReceiver.class);
@@ -116,11 +142,11 @@ public class MdmService extends Service {
                 networkAvailable = true;
                 Log.i(TAG, "Network available");
                 if (!remoteConfigLoaded) {
-                    new Thread(() -> {
+                    executor.submit(() -> {
                         apiService.loadRemoteConfig();
                         remoteConfigLoaded = true;
                         startWebSocket();
-                    }).start();
+                    });
                 }
             }
 
@@ -139,7 +165,7 @@ public class MdmService extends Service {
 
     private void performCheckin() {
         polling = true;
-        new Thread(() -> {
+        executor.submit(() -> {
             try {
                 JSONObject payload = buildCheckinPayload();
                 JSONObject response = apiService.checkin(payload);
@@ -160,13 +186,13 @@ public class MdmService extends Service {
             } finally {
                 polling = false;
             }
-        }).start();
+        });
     }
 
     private synchronized void startWebSocket() {
         if (wsClient != null) return;
         String serial = getDeviceSerial();
-        wsClient = new MdmWebSocketClient(apiService.getApiBaseUrl(), serial, MdmApiService.API_KEY);
+        wsClient = new MdmWebSocketClient(apiService.getApiBaseUrl(), serial, apiService.getApiKey());
         wsClient.setListener(this::handleWsMessage);
         wsClient.start();
         Log.i(TAG, "WebSocket client started");
@@ -176,18 +202,18 @@ public class MdmService extends Service {
         String type = msg.optString("type", "");
         switch (type) {
             case "command":
-                new Thread(() -> {
+                executor.submit(() -> {
                     try { processWsCommand(msg); } catch (Exception e) {
                         Log.e(TAG, "WS command error: " + e.getMessage());
                     }
-                }).start();
+                });
                 break;
             case "logcat_request":
-                new Thread(() -> {
+                executor.submit(() -> {
                     try { processWsLogcatRequest(msg); } catch (Exception e) {
                         Log.e(TAG, "WS logcat error: " + e.getMessage());
                     }
-                }).start();
+                });
                 break;
             default:
                 Log.w(TAG, "Unknown WS message type: " + type);
@@ -212,6 +238,11 @@ public class MdmService extends Service {
                 String shellCmd = payload.optString("cmd", "");
                 if (shellCmd.isEmpty()) {
                     apiService.ackCommand(cmdId, serialNumber, "failed", "empty cmd");
+                    break;
+                }
+                if (!isShellCommandAllowed(shellCmd)) {
+                    Log.w(TAG, "Rejected shell command not on allowlist: " + shellCmd);
+                    apiService.ackCommand(cmdId, serialNumber, "failed", "command not permitted");
                     break;
                 }
                 java.lang.Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", shellCmd});
@@ -287,7 +318,7 @@ public class MdmService extends Service {
                 }
                 otaCommandId = otaCmdId;
                 if (otaUpdateManager == null) {
-                    otaUpdateManager = new OtaUpdateManager(this);
+                    otaUpdateManager = new OtaUpdateManager(this, executor);
                 }
                 otaUpdateManager.setListener(new OtaUpdateManager.Listener() {
                     @Override public void onDownloadProgress(String phase, int percent) {
@@ -306,15 +337,15 @@ public class MdmService extends Service {
                         }
                     }
                     @Override public void onDownloadComplete() {
-                        new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "downloaded", null)).start();
+                        executor.submit(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "downloaded", null));
                     }
                     @Override public void onInstallComplete() {
                         otaCommandId = null;
-                        new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "installed", null)).start();
+                        executor.submit(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "installed", null));
                     }
                     @Override public void onError(String errorCode) {
                         otaCommandId = null;
-                        new Thread(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "error", errorCode)).start();
+                        executor.submit(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "error", errorCode));
                     }
                 });
                 otaUpdateManager.startUpdate(updateUrl);
@@ -651,6 +682,7 @@ public class MdmService extends Service {
     @Override
     public void onDestroy() {
         mainHandler.removeCallbacks(pollRunnable);
+        executor.shutdownNow();
         if (wsClient != null) wsClient.stop();
         if (networkCallback != null) {
             try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) {}
