@@ -211,10 +211,6 @@ public class MdmService extends Service {
     }
 
     private void performCheckin() {
-        if (wsClient != null && wsClient.isConnected()) {
-            sendTelemetryOverWs();
-            return;
-        }
         polling = true;
         executor.submit(() -> {
             try {
@@ -238,6 +234,7 @@ public class MdmService extends Service {
     }
 
     private void sendTelemetryOverWs() {
+        if (wsClient == null || !wsClient.isConnected()) return;
         executor.submit(() -> {
             try {
                 JSONObject payload = buildCheckinPayload();
@@ -260,6 +257,7 @@ public class MdmService extends Service {
         String serial = getDeviceSerial();
         wsClient = new MdmWebSocketClient(apiService.getApiBaseUrl(), serial, apiService.getApiKey());
         wsClient.setListener(this::handleWsMessage);
+        wsClient.setConnectedCallback(this::sendTelemetryOverWs);
         wsClient.start();
         Log.i(TAG, "WebSocket client started");
     }
@@ -280,6 +278,9 @@ public class MdmService extends Service {
                         Log.e(TAG, "WS logcat error: " + e.getMessage());
                     }
                 });
+                break;
+            case "telemetry_request":
+                sendTelemetryOverWs();
                 break;
             case "config":
                 executor.submit(() -> {

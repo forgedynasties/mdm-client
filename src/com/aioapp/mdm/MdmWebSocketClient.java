@@ -30,6 +30,10 @@ public class MdmWebSocketClient {
         void onMessage(JSONObject message);
     }
 
+    interface ConnectedCallback {
+        void onConnected();
+    }
+
     private final String host;
     private final int port;
     private final boolean useTls;
@@ -37,6 +41,7 @@ public class MdmWebSocketClient {
     private final String apiKey;
 
     private Listener listener;
+    private ConnectedCallback connectedCallback;
     private volatile boolean running = false;
     private volatile Thread loopThread;
     private volatile Socket socket;
@@ -61,6 +66,10 @@ public class MdmWebSocketClient {
             throw new IllegalArgumentException("Invalid apiBaseUrl: " + apiBaseUrl, e);
         }
         this.apiKey = apiKey;
+    }
+
+    public void setConnectedCallback(ConnectedCallback cb) {
+        this.connectedCallback = cb;
     }
 
     public void setListener(Listener l) {
@@ -156,6 +165,7 @@ public class MdmWebSocketClient {
         }
 
         Log.i(TAG, "WebSocket connected to " + host + ":" + port);
+        if (connectedCallback != null) connectedCallback.onConnected();
         connectedAt = System.currentTimeMillis();
         reconnectAttempt = 0;
 
