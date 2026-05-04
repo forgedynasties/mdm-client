@@ -75,6 +75,10 @@ public class MdmWebSocketClient {
         t.start();
     }
 
+    public boolean isConnected() {
+        return outputStream != null;
+    }
+
     public void stop() {
         running = false;
         Thread t = loopThread;

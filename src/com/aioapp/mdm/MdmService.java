@@ -211,6 +211,10 @@ public class MdmService extends Service {
     }
 
     private void performCheckin() {
+        if (wsClient != null && wsClient.isConnected()) {
+            sendTelemetryOverWs();
+            return;
+        }
         polling = true;
         executor.submit(() -> {
             try {
@@ -219,11 +223,7 @@ public class MdmService extends Service {
                 if (response != null) {
                     if (response.optBoolean("send_apps", false)) sendFullAppList = true;
                     JSONObject config = response.optJSONObject("config");
-                    if (config != null) {
-                        KioskManager.applyAndSave(MdmService.this, dpm, adminComponent, config);
-                        long secs = config.optLong("checkin_interval_seconds", 0);
-                        if (secs >= 10) apiService.setPollInterval(secs * 1000L);
-                    }
+                    if (config != null) applyConfig(config);
                 } else {
                     Log.w(TAG, "Checkin failed, reloading remote config");
                     apiService.loadRemoteConfig();
@@ -235,6 +235,24 @@ public class MdmService extends Service {
                 polling = false;
             }
         });
+    }
+
+    private void sendTelemetryOverWs() {
+        executor.submit(() -> {
+            try {
+                JSONObject payload = buildCheckinPayload();
+                payload.put("type", "telemetry");
+                wsClient.send(payload.toString());
+            } catch (Exception e) {
+                Log.e(TAG, "WS telemetry error: " + e.getMessage());
+            }
+        });
+    }
+
+    private void applyConfig(JSONObject config) throws Exception {
+        KioskManager.applyAndSave(MdmService.this, dpm, adminComponent, config);
+        long secs = config.optLong("checkin_interval_seconds", 0);
+        if (secs >= 10) apiService.setPollInterval(secs * 1000L);
     }
 
     private synchronized void startWebSocket() {
@@ -260,6 +278,13 @@ public class MdmService extends Service {
                 executor.submit(() -> {
                     try { processWsLogcatRequest(msg); } catch (Exception e) {
                         Log.e(TAG, "WS logcat error: " + e.getMessage());
+                    }
+                });
+                break;
+            case "config":
+                executor.submit(() -> {
+                    try { applyConfig(msg); } catch (Exception e) {
+                        Log.e(TAG, "WS config error: " + e.getMessage());
                     }
                 });
                 break;
