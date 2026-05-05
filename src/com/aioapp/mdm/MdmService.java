@@ -211,8 +211,12 @@ public class MdmService extends Service {
     }
 
     private void performCheckin() {
-        polling = true;
+        if (wsClient != null && wsClient.isConnected()) {
+            sendTelemetryOverWs();
+            return;
+        }
         executor.submit(() -> {
+            polling = true;
             try {
                 JSONObject payload = buildCheckinPayload();
                 JSONObject response = apiService.checkin(payload);
@@ -348,8 +352,12 @@ public class MdmService extends Service {
                         wsClient.send(outFrame.toString());
                     }
                 }
-                int exitCode = p.waitFor();
-                stderrThread.join();
+                boolean finished = p.waitFor(30, TimeUnit.SECONDS);
+                if (!finished) {
+                    p.destroyForcibly();
+                }
+                stderrThread.join(5_000);
+                int exitCode = finished ? p.exitValue() : -1;
                 // Signal stream end so the browser SSE closes
                 JSONObject doneFrame = new JSONObject();
                 doneFrame.put("type", "command_done");
