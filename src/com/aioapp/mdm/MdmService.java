@@ -95,7 +95,7 @@ public class MdmService extends Service {
             "getprop", "setprop", "am", "pm", "wm", "settings",
             "dumpsys", "logcat", "screencap", "input", "service",
             "cmd", "stat", "find", "grep", "awk", "sed",
-            "top", "free", "mount", "lsof"
+            "top", "free", "mount", "lsof", "du"
     ));
 
     private static boolean isShellCommandAllowed(String cmd) {
