@@ -237,6 +237,57 @@ public class MdmService extends Service {
         });
     }
 
+    private void ackCommand(String cmdId, String serial, String status, String output) {
+        if (wsClient != null && wsClient.isConnected()) {
+            try {
+                JSONObject m = new JSONObject();
+                m.put("type", "command_ack");
+                m.put("command_id", cmdId);
+                m.put("serial_number", serial);
+                m.put("status", status);
+                if (!output.isEmpty()) m.put("output", output);
+                wsClient.send(m.toString());
+                return;
+            } catch (Exception e) {
+                Log.e(TAG, "WS ack failed, falling back to HTTP: " + e.getMessage());
+            }
+        }
+        executor.submit(() -> apiService.ackCommand(cmdId, serial, status, output));
+    }
+
+    private void reportLogcat(String requestId, String content) {
+        if (wsClient != null && wsClient.isConnected()) {
+            try {
+                JSONObject m = new JSONObject();
+                m.put("type", "logcat_result");
+                m.put("request_id", requestId);
+                m.put("content", content);
+                wsClient.send(m.toString());
+                return;
+            } catch (Exception e) {
+                Log.e(TAG, "WS logcat failed, falling back to HTTP: " + e.getMessage());
+            }
+        }
+        executor.submit(() -> apiService.postLogcat(getDeviceSerial(), requestId, content));
+    }
+
+    private void reportOtaStatus(String cmdId, String status, String errorCode) {
+        if (wsClient != null && wsClient.isConnected()) {
+            try {
+                JSONObject m = new JSONObject();
+                m.put("type", "ota_status");
+                m.put("command_id", cmdId);
+                m.put("status", status);
+                if (errorCode != null && !errorCode.isEmpty()) m.put("error_code", errorCode);
+                wsClient.send(m.toString());
+                return;
+            } catch (Exception e) {
+                Log.e(TAG, "WS ota_status failed, falling back to HTTP: " + e.getMessage());
+            }
+        }
+        executor.submit(() -> apiService.postOtaStatus(getDeviceSerial(), cmdId, status, errorCode));
+    }
+
     private void sendTelemetryOverWs() {
         if (wsClient == null || !wsClient.isConnected()) return;
         executor.submit(() -> {
@@ -309,18 +360,18 @@ public class MdmService extends Service {
         switch (cmdType) {
             case "install_apk": {
                 boolean ok = installApk(cmd.getString("apk_url"));
-                apiService.ackCommand(cmdId, serialNumber, ok ? "installed" : "failed", "");
+                ackCommand(cmdId, serialNumber, ok ? "installed" : "failed", "");
                 break;
             }
             case "shell": {
                 String shellCmd = payload.optString("cmd", "");
                 if (shellCmd.isEmpty()) {
-                    apiService.ackCommand(cmdId, serialNumber, "failed", "empty cmd");
+                    ackCommand(cmdId, serialNumber, "failed", "empty cmd");
                     break;
                 }
                 if (!isShellCommandAllowed(shellCmd)) {
                     Log.w(TAG, "Rejected shell command not on allowlist: " + shellCmd);
-                    apiService.ackCommand(cmdId, serialNumber, "failed", "command not permitted");
+                    ackCommand(cmdId, serialNumber, "failed", "command not permitted");
                     break;
                 }
                 java.lang.Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", shellCmd});
@@ -367,7 +418,7 @@ public class MdmService extends Service {
                 // HTTP-ack to persist status in DB
                 String output = collected.length() > 0 ? collected.toString()
                         : stderrBuf.toString(StandardCharsets.UTF_8);
-                apiService.ackCommand(cmdId, serialNumber, exitCode == 0 ? "completed" : "failed", output);
+                ackCommand(cmdId, serialNumber, exitCode == 0 ? "completed" : "failed", output);
                 break;
             }
             case "screenshot": {
@@ -384,7 +435,7 @@ public class MdmService extends Service {
                         int n;
                         while ((n = fis.read(buf)) != -1) enc.write(buf, 0, n);
                     }
-                    apiService.ackCommand(cmdId, serialNumber, "completed",
+                    ackCommand(cmdId, serialNumber, "completed",
                             b64Buf.toString(StandardCharsets.UTF_8.name()));
                 } finally {
                     tmp.delete();
@@ -392,7 +443,7 @@ public class MdmService extends Service {
                 break;
             }
             case "get_app_inventory": {
-                apiService.ackCommand(cmdId, serialNumber, "completed", getInstalledApps().toString());
+                ackCommand(cmdId, serialNumber, "completed", getInstalledApps().toString());
                 break;
             }
             case "reboot": {
@@ -430,15 +481,15 @@ public class MdmService extends Service {
                         }
                     }
                     @Override public void onDownloadComplete() {
-                        executor.submit(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "downloaded", null));
+                        reportOtaStatus(otaCmdId, "downloaded", null);
                     }
                     @Override public void onInstallComplete() {
                         otaCommandId = null;
-                        executor.submit(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "installed", null));
+                        reportOtaStatus(otaCmdId, "installed", null);
                     }
                     @Override public void onError(String errorCode) {
                         otaCommandId = null;
-                        executor.submit(() -> apiService.postOtaStatus(otaSerial, otaCmdId, "error", errorCode));
+                        reportOtaStatus(otaCmdId, "error", errorCode);
                     }
                 });
                 otaUpdateManager.startUpdate(updateUrl);
@@ -446,7 +497,7 @@ public class MdmService extends Service {
             }
             default:
                 Log.w(TAG, "Unknown command type: " + cmdType);
-                apiService.ackCommand(cmdId, serialNumber, "failed", "unknown type: " + cmdType);
+                ackCommand(cmdId, serialNumber, "failed", "unknown type: " + cmdType);
         }
     }
 
@@ -494,7 +545,7 @@ public class MdmService extends Service {
 
         String content = sb.toString();
         Log.d(TAG, "Logcat result: " + content.length() + " bytes");
-        apiService.postLogcat(getDeviceSerial(), requestId, content);
+        reportLogcat(requestId, content);
     }
 
     private boolean installApk(String apkUrl) {
