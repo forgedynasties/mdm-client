@@ -120,6 +120,13 @@ public class MdmWebSocketClient {
         Socket s;
         if (useTls) {
             SSLSocket ssl = (SSLSocket) SSLSocketFactory.getDefault().createSocket();
+            // Force HTTP/1.1 via ALPN — WebSocket upgrade is incompatible with h2,
+            // and ALB negotiates h2 by default when the client offers it.
+            if (android.os.Build.VERSION.SDK_INT >= 29) {
+                javax.net.ssl.SSLParameters params = ssl.getSSLParameters();
+                params.setApplicationProtocols(new String[]{"http/1.1"});
+                ssl.setSSLParameters(params);
+            }
             ssl.connect(new InetSocketAddress(host, port), 10_000);
             ssl.startHandshake();
             s = ssl;
