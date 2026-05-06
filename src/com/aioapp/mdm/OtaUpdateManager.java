@@ -238,7 +238,10 @@ public class OtaUpdateManager {
     // ----------------------------------------------------------------
 
     private void finalizeOtaFile(File downloadedFile) throws Exception {
-        Files.createDirectories(Paths.get(OTA_PACKAGE_DIR));
+        java.nio.file.Path otaDir = Paths.get(OTA_PACKAGE_DIR);
+        if (!Files.exists(otaDir)) {
+            Files.createDirectories(otaDir);
+        }
         Files.move(downloadedFile.toPath(), Paths.get(OTA_PACKAGE_PATH),
                 StandardCopyOption.REPLACE_EXISTING);
         Files.setPosixFilePermissions(Paths.get(OTA_PACKAGE_PATH),
