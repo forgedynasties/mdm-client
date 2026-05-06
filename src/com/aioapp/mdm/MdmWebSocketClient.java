@@ -129,6 +129,9 @@ public class MdmWebSocketClient {
             }
             ssl.connect(new InetSocketAddress(host, port), 10_000);
             ssl.startHandshake();
+            if (android.os.Build.VERSION.SDK_INT >= 29) {
+                Log.d(TAG, "ALPN negotiated: " + ssl.getApplicationProtocol());
+            }
             s = ssl;
         } else {
             s = new Socket();
