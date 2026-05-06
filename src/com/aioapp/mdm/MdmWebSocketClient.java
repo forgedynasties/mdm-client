@@ -147,9 +147,11 @@ public class MdmWebSocketClient {
         new SecureRandom().nextBytes(keyBytes);
         String wsKey = Base64.encodeToString(keyBytes, Base64.NO_WRAP);
 
+        boolean defaultPort = (useTls && port == 443) || (!useTls && port == 80);
+        String hostHeader = defaultPort ? host : host + ":" + port;
         String handshake =
                 "GET " + wsPath + " HTTP/1.1\r\n" +
-                "Host: " + host + ":" + port + "\r\n" +
+                "Host: " + hostHeader + "\r\n" +
                 "Upgrade: websocket\r\n" +
                 "Connection: Upgrade\r\n" +
                 "Sec-WebSocket-Key: " + wsKey + "\r\n" +
