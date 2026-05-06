@@ -149,9 +149,15 @@ public class MdmWebSocketClient {
 
         boolean defaultPort = (useTls && port == 443) || (!useTls && port == 80);
         String hostHeader = defaultPort ? host : host + ":" + port;
+        String origin = (useTls ? "https" : "http") + "://" + hostHeader;
         String handshake =
                 "GET " + wsPath + " HTTP/1.1\r\n" +
                 "Host: " + hostHeader + "\r\n" +
+                "User-Agent: AioMDM/" + android.os.Build.VERSION.SDK_INT + "\r\n" +
+                "Accept: */*\r\n" +
+                "Accept-Encoding: gzip, deflate\r\n" +
+                "Accept-Language: en-US\r\n" +
+                "Origin: " + origin + "\r\n" +
                 "Upgrade: websocket\r\n" +
                 "Connection: Upgrade\r\n" +
                 "Sec-WebSocket-Key: " + wsKey + "\r\n" +
