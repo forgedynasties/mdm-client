@@ -229,7 +229,7 @@ public class MdmWebSocketClient {
                     break;
                 }
                 case 0x9: // ping — must respond with pong
-                    sendFrame(0xA, payload);
+                    try { sendFrame(0xA, payload); } catch (IOException ignored) {}
                     break;
                 case 0x8: // close
                     Log.i(TAG, "Server closed the WebSocket");
@@ -238,14 +238,14 @@ public class MdmWebSocketClient {
         }
     }
 
-    public void send(String json) {
+    public void send(String json) throws IOException {
         sendFrame(0x1, json.getBytes(StandardCharsets.UTF_8));
     }
 
     /** Sends a masked WebSocket frame. Client → server frames must always be masked per RFC 6455. */
-    private void sendFrame(int opcode, byte[] payload) {
+    private void sendFrame(int opcode, byte[] payload) throws IOException {
         OutputStream out = this.outputStream;
-        if (out == null) return;
+        if (out == null) throw new IOException("not connected");
         try {
             byte[] mask = new byte[4];
             new SecureRandom().nextBytes(mask);
@@ -275,6 +275,7 @@ public class MdmWebSocketClient {
             Log.e(TAG, "sendFrame failed opcode=0x" + Integer.toHexString(opcode)
                     + " payloadLen=" + payload.length + ": " + e.getMessage());
             closeSocket();
+            throw e;
         }
     }
 
