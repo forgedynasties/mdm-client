@@ -529,7 +529,7 @@ public class MdmService extends Service {
                                 frame.put("phase", phase);
                                 frame.put("percent", percent);
                                 wsClient.send(frame.toString());
-                            } catch (JSONException e) {
+                            } catch (Exception e) {
                                 Log.e(TAG, "Failed to send OTA progress frame: " + e.getMessage());
                             }
                         }
