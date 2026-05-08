@@ -49,6 +49,13 @@ public class MdmWebSocketClient {
     private int reconnectAttempt = 0;
     private long connectedAt = 0;
 
+    // Connection health tracking
+    private volatile long lastDataReceivedAt = 0;
+    private volatile long lastSendAt = 0;
+    private volatile long connectCount = 0;
+    private volatile long sendCount = 0;
+    private volatile long sendFailCount = 0;
+
     /**
      * @param apiBaseUrl  The HTTP base URL, e.g. "http://10.32.0.246:8080"
      * @param serial      Device serial number used as the WS query param
@@ -183,9 +190,12 @@ public class MdmWebSocketClient {
         }
 
         Log.i(TAG, "WebSocket connected to " + host + ":" + port);
-        if (connectedCallback != null) connectedCallback.onConnected();
+        connectCount++;
         connectedAt = System.currentTimeMillis();
+        lastDataReceivedAt = connectedAt;
         reconnectAttempt = 0;
+        if (connectedCallback != null) connectedCallback.onConnected();
+        startPingWatchdog();
 
         // --- WebSocket frame read loop ---
         DataInputStream dis = new DataInputStream(in);
@@ -217,6 +227,7 @@ public class MdmWebSocketClient {
                 reconnectAttempt = 0;
             }
 
+            lastDataReceivedAt = System.currentTimeMillis();
             switch (opcode) {
                 case 0x1: { // text frame
                     String text = new String(payload, StandardCharsets.UTF_8);
@@ -231,6 +242,8 @@ public class MdmWebSocketClient {
                 case 0x9: // ping — must respond with pong
                     try { sendFrame(0xA, payload); } catch (IOException ignored) {}
                     break;
+                case 0xA: // pong — response to our ping, connection confirmed alive
+                    break;
                 case 0x8: // close
                     Log.i(TAG, "Server closed the WebSocket");
                     return; // exit connect() so connectLoop() can reconnect
@@ -239,10 +252,59 @@ public class MdmWebSocketClient {
     }
 
     public void send(String json) throws IOException {
-        sendFrame(0x1, json.getBytes(StandardCharsets.UTF_8));
+        try {
+            sendFrame(0x1, json.getBytes(StandardCharsets.UTF_8));
+            lastSendAt = System.currentTimeMillis();
+            sendCount++;
+        } catch (IOException e) {
+            sendFailCount++;
+            throw e;
+        }
+    }
+
+    public void forceReconnect() {
+        Log.w(TAG, "Forcing WS reconnect (stale connection)");
+        closeSocket();
+    }
+
+    public long getSecsSinceLastSend() {
+        if (lastSendAt == 0) return 0;
+        return (System.currentTimeMillis() - lastSendAt) / 1000;
     }
 
     /** Sends a masked WebSocket frame. Client → server frames must always be masked per RFC 6455. */
+    private void startPingWatchdog() {
+        Thread t = new Thread(() -> {
+            long statsCycle = 0;
+            while (running && isConnected()) {
+                try {
+                    Thread.sleep(30_000);
+                    if (!isConnected()) break;
+                    // Send a probe ping to keep ALB alive and confirm round-trip
+                    try { sendFrame(0x9, new byte[0]); } catch (IOException e) { break; }
+                    // Give server 10s to pong back
+                    Thread.sleep(10_000);
+                    long sinceData = System.currentTimeMillis() - lastDataReceivedAt;
+                    if (isConnected() && sinceData > 45_000) {
+                        Log.w(TAG, "No data from server in " + sinceData + "ms — connection dead, reconnecting");
+                        closeSocket();
+                        break;
+                    }
+                    // Log stats every ~5 minutes (10 cycles × 40s ≈ 5 min)
+                    if (++statsCycle % 8 == 0) {
+                        long uptimeSecs = (System.currentTimeMillis() - connectedAt) / 1000;
+                        Log.i(TAG, "WS stats: sent=" + sendCount + " failed=" + sendFailCount
+                                + " reconnects=" + connectCount + " uptime=" + uptimeSecs + "s");
+                    }
+                } catch (InterruptedException e) {
+                    break;
+                }
+            }
+        }, "mdm-ws-ping");
+        t.setDaemon(true);
+        t.start();
+    }
+
     private void sendFrame(int opcode, byte[] payload) throws IOException {
         OutputStream out = this.outputStream;
         if (out == null) throw new IOException("not connected");

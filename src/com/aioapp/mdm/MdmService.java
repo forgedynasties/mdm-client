@@ -90,6 +90,11 @@ public class MdmService extends Service {
     private String lastAppsHash = null;
     private volatile boolean sendFullAppList = false;
 
+    // Connection health
+    private static final long HTTP_SAFETY_NET_MS = 5 * 60_000L;
+    private static final long STALE_WS_THRESHOLD_SECS = 120;
+    private volatile long lastHttpCheckinAt = 0;
+
     private static final Set<String> ALLOWED_SHELL_COMMANDS = new HashSet<>(Arrays.asList(
             "ls", "cat", "echo", "ps", "df", "uptime", "date", "id",
             "ip", "netstat", "ifconfig", "ping", "nslookup",
@@ -227,30 +232,41 @@ public class MdmService extends Service {
     }
 
     private void performCheckin() {
+        long now = System.currentTimeMillis();
         if (wsClient != null && wsClient.isConnected()) {
-            sendTelemetryOverWs();
-            return;
-        }
-        executor.submit(() -> {
-            polling = true;
-            try {
-                JSONObject payload = buildCheckinPayload();
-                JSONObject response = apiService.checkin(payload);
-                if (response != null) {
-                    if (response.optBoolean("send_apps", false)) sendFullAppList = true;
-                    JSONObject config = response.optJSONObject("config");
-                    if (config != null) applyConfig(config);
-                } else {
-                    Log.w(TAG, "Checkin failed, reloading remote config");
-                    apiService.loadRemoteConfig();
-                    remoteConfigLoaded = true;
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "Checkin error: " + e.getMessage());
-            } finally {
-                polling = false;
+            // Detect stale WS: appears connected but nothing sent in >2 minutes
+            long staleSecs = wsClient.getSecsSinceLastSend();
+            if (staleSecs > STALE_WS_THRESHOLD_SECS) {
+                Log.w(TAG, "WS stale for " + staleSecs + "s, forcing reconnect");
+                wsClient.forceReconnect();
+            } else {
+                sendTelemetryOverWs();
             }
-        });
+        }
+        // HTTP safety net: always checkin via HTTP every 5 minutes regardless of WS state
+        if ((now - lastHttpCheckinAt) >= HTTP_SAFETY_NET_MS) {
+            lastHttpCheckinAt = now;
+            executor.submit(() -> {
+                polling = true;
+                try {
+                    JSONObject payload = buildCheckinPayload();
+                    JSONObject response = apiService.checkin(payload);
+                    if (response != null) {
+                        if (response.optBoolean("send_apps", false)) sendFullAppList = true;
+                        JSONObject config = response.optJSONObject("config");
+                        if (config != null) applyConfig(config);
+                    } else {
+                        Log.w(TAG, "Checkin failed, reloading remote config");
+                        apiService.loadRemoteConfig();
+                        remoteConfigLoaded = true;
+                    }
+                } catch (Exception e) {
+                    Log.e(TAG, "Checkin error: " + e.getMessage());
+                } finally {
+                    polling = false;
+                }
+            });
+        }
     }
 
     private void ackCommand(String cmdId, String serial, String status, String output) {
@@ -312,7 +328,17 @@ public class MdmService extends Service {
                 payload.put("type", "telemetry");
                 wsClient.send(payload.toString());
             } catch (Exception e) {
-                Log.e(TAG, "WS telemetry error: " + e.getMessage());
+                Log.e(TAG, "WS telemetry failed, falling back to HTTP: " + e.getMessage());
+                try {
+                    JSONObject payload = buildCheckinPayload();
+                    JSONObject response = apiService.checkin(payload);
+                    if (response != null) {
+                        JSONObject config = response.optJSONObject("config");
+                        if (config != null) applyConfig(config);
+                    }
+                } catch (Exception e2) {
+                    Log.e(TAG, "HTTP telemetry fallback error: " + e2.getMessage());
+                }
             }
         });
     }
@@ -352,6 +378,18 @@ public class MdmService extends Service {
                 break;
             case "telemetry_request":
                 sendTelemetryOverWs();
+                break;
+            case "ping_request":
+                executor.submit(() -> {
+                    try {
+                        JSONObject pong = new JSONObject();
+                        pong.put("type", "pong_response");
+                        pong.put("nonce", msg.optString("nonce", ""));
+                        wsClient.send(pong.toString());
+                    } catch (Exception e) {
+                        Log.e(TAG, "ping_request handler error: " + e.getMessage());
+                    }
+                });
                 break;
             case "config":
                 executor.submit(() -> {
