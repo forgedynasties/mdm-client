@@ -728,6 +728,7 @@ public class MdmService extends Service {
         extra.put("ram_usage_mb", getRamUsageMb());
         extra.put("timezone", java.util.TimeZone.getDefault().getID());
         extra.put("battery_temp_c", extractBatteryTemperature(batteryIntent));
+        extra.put("charging", extractCharging(batteryIntent));
 
         // Include OTA progress if an update is in progress
         if (otaUpdateManager != null && otaUpdateManager.isActive() && otaCommandId != null) {
@@ -777,6 +778,15 @@ public class MdmService extends Service {
         if (batteryStatus == null) return -999;
         int tenths = batteryStatus.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0);
         return tenths / 10.0f;
+    }
+
+    private boolean extractCharging(Intent batteryStatus) {
+        if (batteryStatus == null) return false;
+        int plugged = batteryStatus.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
+        if (plugged != 0) return true;
+        int status = batteryStatus.getIntExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_UNKNOWN);
+        return status == BatteryManager.BATTERY_STATUS_CHARGING
+                || status == BatteryManager.BATTERY_STATUS_FULL;
     }
 
     private void populateWifiInfo(JSONObject extra) throws JSONException {
