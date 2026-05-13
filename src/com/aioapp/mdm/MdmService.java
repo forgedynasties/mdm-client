@@ -11,7 +11,6 @@ import android.net.wifi.*;
 import android.os.*;
 import android.os.Environment;
 import android.os.StatFs;
-import android.provider.Settings;
 import android.util.Log;
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -122,7 +121,6 @@ public class MdmService extends Service {
         dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
         adminComponent = new ComponentName(this, MdmAdminReceiver.class);
         ensureDeviceOwner();
-        requestBatteryOptimizationExemption();
         createNotificationChannel();
         startForeground(NOTIFICATION_ID, buildNotification("MDM service running"));
         batteryReceiver = new BroadcastReceiver() {
@@ -162,20 +160,6 @@ public class MdmService extends Service {
         long intervalMs = getAdaptivePollInterval() * apiService.getBackoffMultiplier();
         alarmManager.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP,
                 SystemClock.elapsedRealtime() + intervalMs, pollIntent);
-    }
-
-    private void requestBatteryOptimizationExemption() {
-        PowerManager pm = (PowerManager) getSystemService(POWER_SERVICE);
-        if (pm != null && !pm.isIgnoringBatteryOptimizations(getPackageName())) {
-            try {
-                Intent intent = new Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS);
-                intent.setData(android.net.Uri.parse("package:" + getPackageName()));
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                startActivity(intent);
-            } catch (Exception e) {
-                Log.w(TAG, "Could not request battery optimization exemption: " + e.getMessage());
-            }
-        }
     }
 
     private void ensureDeviceOwner() {

@@ -7,4 +7,11 @@ android_app {
     dex_preopt: {
         enabled: false,
     },
+    required: ["mdm-client-sysconfig"],
+}
+
+prebuilt_etc {
+    name: "mdm-client-sysconfig",
+    src: "sysconfig/com.aioapp.mdm.xml",
+    sub_dir: "sysconfig",
 }
