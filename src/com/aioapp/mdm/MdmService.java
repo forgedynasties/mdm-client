@@ -67,6 +67,9 @@ public class MdmService extends Service {
     // Battery: registered once in onCreate, updated via sticky broadcast
     private volatile Intent cachedBatteryIntent = null;
     private BroadcastReceiver batteryReceiver;
+    // Edge-detect charging state so we only push telemetry on plug/unplug
+    // transitions (ACTION_BATTERY_CHANGED fires on every level change too).
+    private volatile int lastChargingState = -1; // -1 unknown, 0 not charging, 1 charging
 
     // Per-field system query caches
     private double cachedStorageFreeGb = 0;
@@ -126,6 +129,13 @@ public class MdmService extends Service {
         batteryReceiver = new BroadcastReceiver() {
             @Override public void onReceive(Context context, Intent intent) {
                 cachedBatteryIntent = intent;
+                int charging = extractCharging(intent) ? 1 : 0;
+                if (lastChargingState != -1 && charging != lastChargingState) {
+                    Log.i(TAG, "Charging state changed: " + lastChargingState + " -> " + charging
+                            + " — pushing immediate telemetry");
+                    sendTelemetryOverWs();
+                }
+                lastChargingState = charging;
             }
         };
         cachedBatteryIntent = registerReceiver(batteryReceiver,
