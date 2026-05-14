@@ -846,13 +846,32 @@ public class MdmService extends Service {
         long now = SystemClock.elapsedRealtime();
         if (wlcLastMs > 0 && now - wlcLastMs < WLC_CACHE_MS) return cachedWlcStatus;
         final String gpioPath = "/sys/devices/platform/soc/soc:customer_gpio/gpio27";
-        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(gpioPath))) {
-            String val = reader.readLine();
-            cachedWlcStatus = (val == null) ? -1 : (val.trim().equals("0") ? 0 : 1);
-        } catch (Exception e) {
-            Log.e(TAG, "getWlcStatus error: " + e.getMessage());
-            cachedWlcStatus = -1;
+        final long windowMs = 500;
+        final long stepMs = 10;
+        boolean sawZero = false;
+        boolean sawOne = false;
+        boolean anyRead = false;
+        long deadline = now + windowMs;
+        while (SystemClock.elapsedRealtime() < deadline) {
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(gpioPath))) {
+                String line = reader.readLine();
+                if (line != null) {
+                    String v = line.replace("\0", "").trim();
+                    if (v.equals("0")) { sawZero = true; anyRead = true; }
+                    else if (v.equals("1")) { sawOne = true; anyRead = true; }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "getWlcStatus error: " + e.getMessage());
+                cachedWlcStatus = -1;
+                wlcLastMs = now;
+                return cachedWlcStatus;
+            }
+            try { Thread.sleep(stepMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
         }
+        if (!anyRead) cachedWlcStatus = -1;
+        else if (sawZero && sawOne) cachedWlcStatus = 2; // pad disconnected (toggling)
+        else if (sawOne) cachedWlcStatus = 1;            // device placed
+        else cachedWlcStatus = 0;                        // no device
         wlcLastMs = now;
         return cachedWlcStatus;
     }
