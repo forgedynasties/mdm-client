@@ -80,6 +80,10 @@ public class MdmService extends Service {
     private long wifiLastMs = 0;
     private static final long WIFI_CACHE_MS = 300_000;
 
+    private JSONArray cachedWifiScan = null;
+    private long wifiScanLastMs = 0;
+    private static final long WIFI_SCAN_CACHE_MS = 60_000;
+
     private JSONObject cachedRam = null;
     private long ramLastMs = 0;
     private static final long RAM_CACHE_MS = 30_000;
@@ -732,6 +736,7 @@ public class MdmService extends Service {
 
         JSONObject extra = new JSONObject();
         populateWifiInfo(extra);
+        populateWifiScanResults(extra);
         extra.put("storage_free_gb", getStorageFreeGb());
         extra.put("uptime_seconds", SystemClock.elapsedRealtime() / 1000);
         extra.put("wlc_status", getWlcStatus());
@@ -826,6 +831,39 @@ public class MdmService extends Service {
         wifiLastMs = now;
         extra.put("ip_address", cachedWifiExtra.opt("ip_address"));
         extra.put("wifi", cachedWifiExtra.opt("wifi"));
+    }
+
+    private void populateWifiScanResults(JSONObject extra) throws JSONException {
+        long now = SystemClock.elapsedRealtime();
+        if (cachedWifiScan != null && now - wifiScanLastMs < WIFI_SCAN_CACHE_MS) {
+            extra.put("wifi_scan", cachedWifiScan);
+            return;
+        }
+        cachedWifiScan = new JSONArray();
+        try {
+            WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
+            if (wm == null) {
+                extra.put("wifi_scan", cachedWifiScan);
+                wifiScanLastMs = now;
+                return;
+            }
+            List<ScanResult> results = wm.getScanResults();
+            if (results != null) {
+                for (ScanResult sr : results) {
+                    JSONObject ap = new JSONObject();
+                    ap.put("bssid", sr.BSSID);
+                    ap.put("ssid", sr.SSID);
+                    ap.put("rssi", sr.level);
+                    cachedWifiScan.put(ap);
+                }
+            }
+        } catch (SecurityException e) {
+            Log.w(TAG, "WiFi scan permission denied: " + e.getMessage());
+        } catch (Exception e) {
+            Log.e(TAG, "WiFi scan error: " + e.getMessage());
+        }
+        wifiScanLastMs = now;
+        extra.put("wifi_scan", cachedWifiScan);
     }
 
     private JSONObject getRamUsageMb() throws JSONException {
