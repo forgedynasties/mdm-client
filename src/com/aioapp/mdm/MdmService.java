@@ -843,12 +843,14 @@ public class MdmService extends Service {
         try {
             WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             if (wm == null) {
+                Log.w(TAG, "WiFi scan skipped: WifiManager is null");
                 extra.put("wifi_scan", cachedWifiScan);
                 wifiScanLastMs = now;
                 return;
             }
             List<ScanResult> results = wm.getScanResults();
             if (results != null) {
+                Log.i(TAG, "WiFi scan returned " + results.size() + " APs");
                 for (ScanResult sr : results) {
                     JSONObject ap = new JSONObject();
                     ap.put("bssid", sr.BSSID);
@@ -856,6 +858,8 @@ public class MdmService extends Service {
                     ap.put("rssi", sr.level);
                     cachedWifiScan.put(ap);
                 }
+            } else {
+                Log.w(TAG, "WiFi scan returned null");
             }
         } catch (SecurityException e) {
             Log.w(TAG, "WiFi scan permission denied: " + e.getMessage());
