@@ -40,6 +40,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 
 public class MdmService extends Service {
     private static final String TAG = "MdmService";
+    private static final String LOCATION_TAG = "MdmLocation";
     private static final String CHANNEL_ID = "MDM_SERVICE";
     private static final int NOTIFICATION_ID = 1001;
 
@@ -836,21 +837,63 @@ public class MdmService extends Service {
     private void populateWifiScanResults(JSONObject extra) throws JSONException {
         long now = SystemClock.elapsedRealtime();
         if (cachedWifiScan != null && now - wifiScanLastMs < WIFI_SCAN_CACHE_MS) {
+            Log.i(LOCATION_TAG, "Using cached WiFi scan: " + cachedWifiScan.length() + " APs");
             extra.put("wifi_scan", cachedWifiScan);
             return;
         }
+        Log.i(LOCATION_TAG, "Starting WiFi scan...");
         cachedWifiScan = new JSONArray();
         try {
             WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             if (wm == null) {
-                Log.w(TAG, "WiFi scan skipped: WifiManager is null");
+                Log.w(LOCATION_TAG, "WiFi scan skipped: WifiManager is null");
                 extra.put("wifi_scan", cachedWifiScan);
                 wifiScanLastMs = now;
                 return;
             }
-            List<ScanResult> results = wm.getScanResults();
+
+            // Trigger an active scan and wait up to 5s for fresh results.
+            // Without startScan(), getScanResults() only returns cached data from
+            // other apps — which on a kiosk device is usually empty.
+            final CountDownLatch latch = new CountDownLatch(1);
+            final List<ScanResult>[] holder = new List[1];
+
+            BroadcastReceiver receiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    Log.i(LOCATION_TAG, "Scan results available broadcast received");
+                    holder[0] = wm.getScanResults();
+                    latch.countDown();
+                }
+            };
+
+            IntentFilter filter = new IntentFilter(WifiManager.SCAN_RESULTS_AVAILABLE_ACTION);
+            getApplicationContext().registerReceiver(receiver, filter);
+
+            try {
+                boolean scanStarted = wm.startScan();
+                Log.i(LOCATION_TAG, "startScan() returned: " + scanStarted);
+
+                if (scanStarted) {
+                    boolean gotResults = latch.await(5, TimeUnit.SECONDS);
+                    if (!gotResults) {
+                        Log.w(LOCATION_TAG, "WiFi scan timed out after 5s, falling back to cached results");
+                        holder[0] = wm.getScanResults();
+                    }
+                } else {
+                    Log.w(LOCATION_TAG, "startScan() returned false, using cached results");
+                    holder[0] = wm.getScanResults();
+                }
+            } finally {
+                try {
+                    getApplicationContext().unregisterReceiver(receiver);
+                } catch (IllegalArgumentException ignored) {
+                }
+            }
+
+            List<ScanResult> results = holder[0];
             if (results != null) {
-                Log.i(TAG, "WiFi scan returned " + results.size() + " APs");
+                Log.i(LOCATION_TAG, "WiFi scan returned " + results.size() + " APs");
                 for (ScanResult sr : results) {
                     JSONObject ap = new JSONObject();
                     ap.put("bssid", sr.BSSID);
@@ -859,15 +902,16 @@ public class MdmService extends Service {
                     cachedWifiScan.put(ap);
                 }
             } else {
-                Log.w(TAG, "WiFi scan returned null");
+                Log.w(LOCATION_TAG, "WiFi scan returned null");
             }
         } catch (SecurityException e) {
-            Log.w(TAG, "WiFi scan permission denied: " + e.getMessage());
+            Log.w(LOCATION_TAG, "WiFi scan permission denied: " + e.getMessage());
         } catch (Exception e) {
-            Log.e(TAG, "WiFi scan error: " + e.getMessage());
+            Log.e(LOCATION_TAG, "WiFi scan error: " + e.getMessage());
         }
         wifiScanLastMs = now;
         extra.put("wifi_scan", cachedWifiScan);
+        Log.i(LOCATION_TAG, "WiFi scan complete: " + cachedWifiScan.length() + " APs in cache");
     }
 
     private JSONObject getRamUsageMb() throws JSONException {
