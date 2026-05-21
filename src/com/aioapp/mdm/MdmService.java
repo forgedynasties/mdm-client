@@ -33,7 +33,9 @@ import java.util.Set;
 import java.util.zip.CRC32;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -64,6 +66,7 @@ public class MdmService extends Service {
     private BroadcastReceiver packageChangeReceiver;
     private String lastNotificationText = "";
     private ExecutorService executor;
+    private ScheduledExecutorService wifiScanExecutor;
 
     // Battery: registered once in onCreate, updated via sticky broadcast
     private volatile Intent cachedBatteryIntent = null;
@@ -82,8 +85,7 @@ public class MdmService extends Service {
     private static final long WIFI_CACHE_MS = 300_000;
 
     private JSONArray cachedWifiScan = null;
-    private long wifiScanLastMs = 0;
-    private static final long WIFI_SCAN_CACHE_MS = 60_000;
+    private static final long WIFI_SCAN_INTERVAL_SEC = 60;
 
     private JSONObject cachedRam = null;
     private long ramLastMs = 0;
@@ -124,6 +126,8 @@ public class MdmService extends Service {
         super.onCreate();
         executor = new ThreadPoolExecutor(2, 4, 60, TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(16), new ThreadPoolExecutor.DiscardOldestPolicy());
+        wifiScanExecutor = Executors.newSingleThreadScheduledExecutor();
+        wifiScanExecutor.scheduleWithFixedDelay(this::runWifiScan, 0, WIFI_SCAN_INTERVAL_SEC, TimeUnit.SECONDS);
         apiService = new MdmApiService();
         connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
@@ -834,27 +838,25 @@ public class MdmService extends Service {
         extra.put("wifi", cachedWifiExtra.opt("wifi"));
     }
 
+    /** Non-blocking: writes the latest cached scan into the checkin extra. */
     private void populateWifiScanResults(JSONObject extra) throws JSONException {
-        long now = SystemClock.elapsedRealtime();
-        if (cachedWifiScan != null && now - wifiScanLastMs < WIFI_SCAN_CACHE_MS) {
-            Log.i(LOCATION_TAG, "Using cached WiFi scan: " + cachedWifiScan.length() + " APs");
+        if (cachedWifiScan != null) {
             extra.put("wifi_scan", cachedWifiScan);
-            return;
+        } else {
+            extra.put("wifi_scan", new JSONArray());
         }
+    }
+
+    /** Runs on wifiScanExecutor every WIFI_SCAN_INTERVAL_SEC; blocks up to 5s per scan. */
+    private void runWifiScan() {
         Log.i(LOCATION_TAG, "Starting WiFi scan...");
-        cachedWifiScan = new JSONArray();
         try {
             WifiManager wm = (WifiManager) getApplicationContext().getSystemService(Context.WIFI_SERVICE);
             if (wm == null) {
                 Log.w(LOCATION_TAG, "WiFi scan skipped: WifiManager is null");
-                extra.put("wifi_scan", cachedWifiScan);
-                wifiScanLastMs = now;
                 return;
             }
 
-            // Trigger an active scan and wait up to 5s for fresh results.
-            // Without startScan(), getScanResults() only returns cached data from
-            // other apps — which on a kiosk device is usually empty.
             final CountDownLatch latch = new CountDownLatch(1);
             final List<ScanResult>[] holder = new List[1];
 
@@ -893,6 +895,7 @@ public class MdmService extends Service {
 
             List<ScanResult> results = holder[0];
             if (results != null) {
+                cachedWifiScan = new JSONArray();
                 Log.i(LOCATION_TAG, "WiFi scan returned " + results.size() + " APs");
                 for (ScanResult sr : results) {
                     JSONObject ap = new JSONObject();
@@ -909,9 +912,7 @@ public class MdmService extends Service {
         } catch (Exception e) {
             Log.e(LOCATION_TAG, "WiFi scan error: " + e.getMessage());
         }
-        wifiScanLastMs = now;
-        extra.put("wifi_scan", cachedWifiScan);
-        Log.i(LOCATION_TAG, "WiFi scan complete: " + cachedWifiScan.length() + " APs in cache");
+        Log.i(LOCATION_TAG, "WiFi scan complete: " + (cachedWifiScan != null ? cachedWifiScan.length() : 0) + " APs in cache");
     }
 
     private JSONObject getRamUsageMb() throws JSONException {
@@ -1058,6 +1059,7 @@ public class MdmService extends Service {
             try { unregisterReceiver(pollReceiver); } catch (Exception ignored) {}
         }
         executor.shutdownNow();
+        wifiScanExecutor.shutdownNow();
         if (wsClient != null) wsClient.stop();
         if (networkCallback != null) {
             try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) {}
