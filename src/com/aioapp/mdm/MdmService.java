@@ -409,6 +409,20 @@ public class MdmService extends Service {
                     }
                 });
                 break;
+            case "start_capture":
+                executor.submit(() -> {
+                    int quality = msg.optInt("quality", 60);
+                    double scale = msg.optDouble("scale", 0.5);
+                    int maxFps = msg.optInt("max_fps", 10);
+                    if (!isCapturing) {
+                        isCapturing = true;
+                        runCaptureLoop(quality, scale, maxFps);
+                    }
+                });
+                break;
+            case "stop_capture":
+                isCapturing = false;
+                break;
             default:
                 Log.w(TAG, "Unknown WS message type: " + type);
         }
