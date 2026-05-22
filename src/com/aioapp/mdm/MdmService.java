@@ -630,8 +630,34 @@ public class MdmService extends Service {
     }
 
     private android.graphics.Bitmap captureScreen(int w, int h, int rotation) {
-        return android.view.SurfaceControl.screenshot(
-                new android.graphics.Rect(), w, h, rotation);
+        try {
+            java.lang.reflect.Method method = android.view.SurfaceControl.class.getMethod(
+                    "screenshot", android.graphics.Rect.class, int.class, int.class, int.class);
+            return (android.graphics.Bitmap) method.invoke(null,
+                    new android.graphics.Rect(), w, h, rotation);
+        } catch (Exception e) {
+            Log.w(TAG, "SurfaceControl.screenshot() failed, falling back to screencap: " + e.getMessage());
+            return captureScreenFallback(w, h);
+        }
+    }
+
+    private android.graphics.Bitmap captureScreenFallback(int maxW, int maxH) {
+        File tmp = new File(getCacheDir(), "mdm_remote_" + System.currentTimeMillis() + ".png");
+        try {
+            java.lang.Process p = Runtime.getRuntime().exec(
+                    new String[]{"screencap", "-p", tmp.getAbsolutePath()});
+            p.waitFor();
+            android.graphics.BitmapFactory.Options opts = new android.graphics.BitmapFactory.Options();
+            opts.inSampleSize = 2; // half resolution as fallback
+            android.graphics.Bitmap bmp = android.graphics.BitmapFactory.decodeFile(
+                    tmp.getAbsolutePath(), opts);
+            return bmp;
+        } catch (Exception e) {
+            Log.e(TAG, "screencap fallback failed: " + e.getMessage());
+            return null;
+        } finally {
+            tmp.delete();
+        }
     }
 
     private void handleInputEvent(JSONObject msg) throws Exception {
