@@ -61,6 +61,7 @@ public class MdmService extends Service {
     private volatile boolean remoteConfigLoaded = false;
     private OtaUpdateManager otaUpdateManager;
     private volatile String otaCommandId;  // set while an OTA is in progress
+    private volatile boolean isCapturing = false;
     private MdmWebSocketClient wsClient;
     private JSONArray cachedInstalledApps = null;
     private BroadcastReceiver packageChangeReceiver;
@@ -401,6 +402,13 @@ public class MdmService extends Service {
                     }
                 });
                 break;
+            case "input_event":
+                executor.submit(() -> {
+                    try { handleInputEvent(msg); } catch (Exception e) {
+                        Log.e(TAG, "input_event error: " + e.getMessage());
+                    }
+                });
+                break;
             default:
                 Log.w(TAG, "Unknown WS message type: " + type);
         }
@@ -552,12 +560,130 @@ public class MdmService extends Service {
                 otaUpdateManager.startUpdate(updateUrl);
                 break;
             }
+            case "start_capture": {
+                int quality = payload.optInt("quality", 60);
+                double scale = payload.optDouble("scale", 0.5);
+                int maxFps = payload.optInt("max_fps", 10);
+                if (!isCapturing) {
+                    isCapturing = true;
+                    executor.submit(() -> runCaptureLoop(quality, scale, maxFps));
+                }
+                ackCommand(cmdId, serialNumber, "completed", "");
+                break;
+            }
+            case "stop_capture": {
+                isCapturing = false;
+                ackCommand(cmdId, serialNumber, "completed", "");
+                break;
+            }
             default:
                 Log.w(TAG, "Unknown command type: " + cmdType);
                 ackCommand(cmdId, serialNumber, "failed", "unknown type: " + cmdType);
         }
     }
 
+
+    private void runCaptureLoop(int quality, double scale, int maxFps) {
+        android.view.Display display = getDisplay();
+        if (display == null) {
+            Log.e(TAG, "Cannot get display for capture");
+            isCapturing = false;
+            return;
+        }
+        android.graphics.Point size = new android.graphics.Point();
+        display.getRealSize(size);
+        int scaledW = (int) (size.x * scale);
+        int scaledH = (int) (size.y * scale);
+        int rotation = display.getRotation();
+
+        long targetMs = 1000 / maxFps;
+        Log.i(TAG, "Capture loop started — scaled=" + scaledW + "x" + scaledH
+                + " quality=" + quality + " fps=" + maxFps);
+
+        while (isCapturing && wsClient != null && wsClient.isConnected()) {
+            long start = System.currentTimeMillis();
+            try {
+                android.graphics.Bitmap screen = captureScreen(scaledW, scaledH, rotation);
+                if (screen == null) {
+                    Thread.sleep(targetMs);
+                    continue;
+                }
+                java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(32768);
+                screen.compress(android.graphics.Bitmap.CompressFormat.WEBP, quality, bos);
+                screen.recycle();
+
+                byte[] frame = bos.toByteArray();
+                wsClient.sendBinary(frame);
+
+                long elapsed = System.currentTimeMillis() - start;
+                if (elapsed < targetMs) {
+                    Thread.sleep(targetMs - elapsed);
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "Capture loop error: " + e.getMessage());
+                if (wsClient == null || !wsClient.isConnected()) break;
+                try { Thread.sleep(500); } catch (InterruptedException ignored) {}
+            }
+        }
+        isCapturing = false;
+        Log.i(TAG, "Capture loop stopped");
+    }
+
+    private android.graphics.Bitmap captureScreen(int w, int h, int rotation) {
+        return android.view.SurfaceControl.screenshot(
+                new android.graphics.Rect(), w, h, rotation);
+    }
+
+    private void handleInputEvent(JSONObject msg) throws Exception {
+        float normX = (float) msg.optDouble("x", 0.5);
+        float normY = (float) msg.optDouble("y", 0.5);
+        String action = msg.optString("action", "touch");
+        String event = msg.optString("event", "down");
+
+        android.hardware.input.InputManager im =
+                (android.hardware.input.InputManager) getSystemService(Context.INPUT_SERVICE);
+
+        if ("touch".equals(action)) {
+            android.view.Display display = null;
+            if (android.os.Build.VERSION.SDK_INT >= 30) {
+                display = getDisplay();
+            }
+            int displayW = 1080, displayH = 1920;
+            if (display != null) {
+                android.graphics.Point size = new android.graphics.Point();
+                display.getRealSize(size);
+                displayW = size.x;
+                displayH = size.y;
+            }
+            float x = normX * displayW;
+            float y = normY * displayH;
+
+            int actionCode;
+            switch (event) {
+                case "down":  actionCode = android.view.MotionEvent.ACTION_DOWN; break;
+                case "move":  actionCode = android.view.MotionEvent.ACTION_MOVE; break;
+                case "up":    actionCode = android.view.MotionEvent.ACTION_UP; break;
+                default:      actionCode = android.view.MotionEvent.ACTION_DOWN; break;
+            }
+
+            long now = android.os.SystemClock.uptimeMillis();
+            android.view.MotionEvent me = android.view.MotionEvent.obtain(
+                    now, now, actionCode, x, y, 0);
+            im.injectInputEvent(me, android.hardware.input.InputManager.INJECT_INPUT_EVENT_MODE_ASYNC);
+            me.recycle();
+
+        } else if ("key".equals(action)) {
+            int keycode = msg.optInt("keycode", 0);
+            int keyAction = "down".equals(event)
+                    ? android.view.KeyEvent.ACTION_DOWN
+                    : android.view.KeyEvent.ACTION_UP;
+
+            long now = android.os.SystemClock.uptimeMillis();
+            android.view.KeyEvent ke = new android.view.KeyEvent(now, now, keyAction, keycode, 0);
+            im.injectInputEvent(ke, android.hardware.input.InputManager.INJECT_INPUT_EVENT_MODE_ASYNC);
+            ke.recycle();
+        }
+    }
 
     private void processWsLogcatRequest(JSONObject req) throws Exception {
         String requestId = req.getString("id");
@@ -1054,6 +1180,7 @@ public class MdmService extends Service {
 
     @Override
     public void onDestroy() {
+        isCapturing = false;
         alarmManager.cancel(pollIntent);
         if (pollReceiver != null) {
             try { unregisterReceiver(pollReceiver); } catch (Exception ignored) {}

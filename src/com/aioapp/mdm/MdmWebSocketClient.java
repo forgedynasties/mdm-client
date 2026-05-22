@@ -262,6 +262,18 @@ public class MdmWebSocketClient {
         }
     }
 
+    /** Sends a binary WebSocket frame (opcode 0x2). Masked per RFC 6455. */
+    public void sendBinary(byte[] data) throws IOException {
+        try {
+            sendFrame(0x2, data);
+            lastSendAt = System.currentTimeMillis();
+            sendCount++;
+        } catch (IOException e) {
+            sendFailCount++;
+            throw e;
+        }
+    }
+
     public void forceReconnect() {
         Log.w(TAG, "Forcing WS reconnect (stale connection)");
         closeSocket();
