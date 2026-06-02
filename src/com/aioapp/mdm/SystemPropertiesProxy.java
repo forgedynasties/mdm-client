@@ -16,4 +16,18 @@ public class SystemPropertiesProxy {
             return def;
         }
     }
+
+    /** Sets a system property. Requires the caller to be permitted by the
+     *  property's SELinux context (the splash props are set-able by system_app). */
+    public static boolean set(String key, String value) {
+        try {
+            Class<?> systemPropertiesClass = Class.forName("android.os.SystemProperties");
+            Method setMethod = systemPropertiesClass.getMethod("set", String.class, String.class);
+            setMethod.invoke(null, key, value);
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to invoke SystemProperties.set(" + key + "): " + e.getMessage());
+            return false;
+        }
+    }
 }

@@ -574,6 +574,21 @@ public class MdmService extends Service {
                 otaUpdateManager.startUpdate(updateUrl);
                 break;
             }
+            case "update_splash": {
+                // Replace the boot logo. The image is staged + flashed by an
+                // init broker (the app can't write the block device); we only
+                // transport the file and trigger. Runs on the worker thread.
+                String splashUrl = payload.optString("url", "");
+                if (splashUrl.isEmpty()) {
+                    ackCommand(cmdId, serialNumber, "failed", "missing url");
+                    break;
+                }
+                long partitionSize = payload.optLong("partition_size", 0);
+                String status = downloadAndUpdateSplash(splashUrl, partitionSize);
+                boolean ok = "ok".equals(status);
+                ackCommand(cmdId, serialNumber, ok ? "completed" : "failed", status);
+                break;
+            }
             case "start_capture": {
                 int quality = payload.optInt("quality", 60);
                 double scale = payload.optDouble("scale", 0.5);
@@ -769,6 +784,32 @@ public class MdmService extends Service {
         String content = sb.toString();
         Log.d(TAG, "Logcat result: " + content.length() + " bytes");
         reportLogcat(requestId, content);
+    }
+
+    /**
+     * Downloads a splash image and hands it to the broker via {@link SplashUpdater}.
+     * Streams straight from the network into staging — a bad magic fails before
+     * the whole file is pulled. Returns the broker's final status string (or an
+     * {@code error_*} reason on transport failure).
+     */
+    private String downloadAndUpdateSplash(String imageUrl, long partitionSize) {
+        try {
+            URL url = new URL(imageUrl);
+            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+            conn.setConnectTimeout(30_000);
+            conn.setReadTimeout(60_000);
+            conn.connect();
+            if (conn.getResponseCode() != HttpURLConnection.HTTP_OK) {
+                Log.e(TAG, "Splash download failed: HTTP " + conn.getResponseCode());
+                return "error_download";
+            }
+            try (InputStream in = conn.getInputStream()) {
+                return SplashUpdater.updateSplash(in, partitionSize);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "Splash update error: " + e.getMessage());
+            return "error_download";
+        }
     }
 
     private boolean installApk(String apkUrl) {
