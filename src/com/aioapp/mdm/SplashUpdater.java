@@ -5,7 +5,6 @@ import android.util.Log;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStream;
-import java.util.Arrays;
 
 /**
  * Replaces the boot logo (splash) partition at runtime.
@@ -31,8 +30,16 @@ public final class SplashUpdater {
      *  vendor_splash_data_file — uid system writes it directly, no restorecon. */
     static final String SPLASH_PATH = "/data/vendor/splash/splash.img";
 
-    /** Qualcomm splash container magic: "SPLASH!!" (53 50 4C 41 53 48 21 21). */
-    private static final byte[] MAGIC = {0x53, 0x50, 0x4C, 0x41, 0x53, 0x48, 0x21, 0x21};
+    /**
+     * Legacy Qualcomm splash layout (produced by splash_logo_gen.py): {@link #BMP_OFFSET}
+     * bytes of zero filler followed by a raw BMP. There is no "SPLASH!!" container header
+     * in this format — the bootloader skips the filler and parses the BMP directly — so we
+     * validate the BMP signature at {@link #BMP_OFFSET} as the fail-fast sanity check.
+     */
+    private static final int BMP_OFFSET = 0x4000;
+
+    /** BMP signature ("BM") expected at {@link #BMP_OFFSET}. */
+    private static final byte[] BMP_MAGIC = {0x42, 0x4D};
 
     static final String PROP_FLASH = "vendor.splash.flash";
     static final String PROP_STATUS = "vendor.splash.status";
@@ -64,7 +71,7 @@ public final class SplashUpdater {
             return "busy";
         }
 
-        // 1. Stage — validate the magic on the first 8 bytes before committing the
+        // 1. Stage — validate the BMP signature at 0x4000 before committing the
         //    rest, so a wrong file fails fast without a full download/write.
         String staged = stage(newImage, dst, maxSizeBytes);
         if (!"ok".equals(staged)) {
@@ -94,8 +101,9 @@ public final class SplashUpdater {
     /** Writes the validated image to {@code dst}. Returns {@code "ok"} or an
      *  {@code error_*} reason; deletes any partial file on failure. */
     private static String stage(InputStream in, File dst, long maxSizeBytes) {
-        // Read and validate the magic header first.
-        byte[] header = new byte[MAGIC.length];
+        // Read the leading filler plus the BMP signature so we can fail fast on a
+        // wrong file (e.g. an HTML error page) before pulling/writing the whole image.
+        byte[] header = new byte[BMP_OFFSET + BMP_MAGIC.length];
         int read = 0;
         try {
             int n;
@@ -106,8 +114,10 @@ public final class SplashUpdater {
             Log.e(TAG, "Splash read error: " + e.getMessage());
             return "error_read";
         }
-        if (read < header.length || !Arrays.equals(header, MAGIC)) {
-            Log.e(TAG, "Splash image missing SPLASH!! magic");
+        if (read < header.length
+                || header[BMP_OFFSET] != BMP_MAGIC[0]
+                || header[BMP_OFFSET + 1] != BMP_MAGIC[1]) {
+            Log.e(TAG, "Splash image not in expected format (no BMP at 0x" + Integer.toHexString(BMP_OFFSET) + ")");
             return "error_magic";
         }
 

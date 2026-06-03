@@ -788,7 +788,7 @@ public class MdmService extends Service {
 
     /**
      * Downloads a splash image and hands it to the broker via {@link SplashUpdater}.
-     * Streams straight from the network into staging — a bad magic fails before
+     * Streams straight from the network into staging — a wrong file fails before
      * the whole file is pulled. Returns the broker's final status string (or an
      * {@code error_*} reason on transport failure).
      */
