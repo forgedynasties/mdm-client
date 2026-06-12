@@ -38,8 +38,13 @@ public class OtaUpdateManager {
     private static final String OTA_PACKAGE_DIR = "/data/ota_package";
     private static final String OTA_PACKAGE_PATH = OTA_PACKAGE_DIR + "/update.zip";
     private static final String TEMP_FILE_NAME = "update_temp.zip";
-    private static final long WAKE_LOCK_TIMEOUT_MS = 3_600_000L; // 1 hour
-    private static final long WAKE_LOCK_SAFETY_MS  =   30 * 60_000L; // 30 min force-release
+    // 2 hours covers a full-image download + install on slow Wi-Fi (legacy
+    // ota-app parity); the safety timer is a backstop slightly past the timeout.
+    private static final long WAKE_LOCK_TIMEOUT_MS = 2 * 3_600_000L;
+    private static final long WAKE_LOCK_SAFETY_MS  = WAKE_LOCK_TIMEOUT_MS + 10 * 60_000L;
+
+    private static final int DOWNLOAD_CONNECT_TIMEOUT_MS = 15_000;
+    private static final int DOWNLOAD_READ_TIMEOUT_MS    = 60_000;
 
     public interface Listener {
         void onDownloadProgress(String phase, int percent);
@@ -198,6 +203,10 @@ public class OtaUpdateManager {
         long existingSize = targetFile.exists() ? targetFile.length() : 0;
         URL url = new URL(fileUrl);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
+        // Without a read timeout a dead connection blocks this thread until the
+        // wake lock expires; with Range resume a retry is cheap.
+        conn.setConnectTimeout(DOWNLOAD_CONNECT_TIMEOUT_MS);
+        conn.setReadTimeout(DOWNLOAD_READ_TIMEOUT_MS);
 
         if (existingSize > 0) {
             conn.setRequestProperty("Range", "bytes=" + existingSize + "-");

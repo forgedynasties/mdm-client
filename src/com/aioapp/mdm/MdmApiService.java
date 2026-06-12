@@ -18,15 +18,28 @@ public class MdmApiService {
     private static final boolean USE_LOCAL_SERVER = true;
     private static final String LOCAL_API_BASE_URL = "http://10.32.1.170:8080";
     private static final String DEFAULT_API_BASE_URL = "https://udm.dev.aioapp.com";
+    // Persistent system property that re-points the fleet at a different server
+    // without a system update: setprop persist.sys.mdm.url https://host[:port]
+    private static final String URL_OVERRIDE_PROP = "persist.sys.mdm.url";
 
     private static final long DEFAULT_POLL_INTERVAL_MS = 30_000;
     private static final Random JITTER = new Random();
 
-    private String apiBaseUrl = USE_LOCAL_SERVER ? LOCAL_API_BASE_URL : DEFAULT_API_BASE_URL;
+    private String apiBaseUrl = resolveBaseUrl();
     private long pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
     private int consecutiveFailures = 0;
 
     public MdmApiService() {}
+
+    private static String resolveBaseUrl() {
+        String override = SystemPropertiesProxy.get(URL_OVERRIDE_PROP, "");
+        if (override != null && !override.trim().isEmpty()) {
+            String url = override.trim();
+            Log.i(TAG, "Server URL overridden via " + URL_OVERRIDE_PROP + ": " + url);
+            return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
+        }
+        return USE_LOCAL_SERVER ? LOCAL_API_BASE_URL : DEFAULT_API_BASE_URL;
+    }
 
     public String getApiKey() { return API_KEY; }
 
@@ -43,7 +56,9 @@ public class MdmApiService {
     }
 
     public void loadRemoteConfig() {
-        // URL override can be added here if needed
+        // Re-read the persistent property so a setprop takes effect at the next
+        // sync without restarting the service.
+        apiBaseUrl = resolveBaseUrl();
     }
 
     /**

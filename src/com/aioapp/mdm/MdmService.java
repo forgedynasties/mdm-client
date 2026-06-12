@@ -545,6 +545,7 @@ public class MdmService extends Service {
                 }
                 otaUpdateManager.setListener(new OtaUpdateManager.Listener() {
                     @Override public void onDownloadProgress(String phase, int percent) {
+                        updateNotificationIfNeeded("System update: " + phase + " " + percent + "%");
                         // Send real-time progress via WebSocket
                         if (wsClient != null) {
                             try {
@@ -560,14 +561,17 @@ public class MdmService extends Service {
                         }
                     }
                     @Override public void onDownloadComplete() {
+                        updateNotificationIfNeeded("System update: download complete, installing…");
                         reportOtaStatus(otaCmdId, "downloaded", null);
                     }
                     @Override public void onInstallComplete() {
                         otaCommandId = null;
+                        updateNotificationIfNeeded("System update installed — awaiting reboot");
                         reportOtaStatus(otaCmdId, "installed", null);
                     }
                     @Override public void onError(String errorCode) {
                         otaCommandId = null;
+                        updateNotificationIfNeeded("System update failed (" + errorCode + ")");
                         reportOtaStatus(otaCmdId, "error", errorCode);
                     }
                 });
