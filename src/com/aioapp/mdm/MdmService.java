@@ -336,6 +336,46 @@ public class MdmService extends Service {
         executor.submit(() -> apiService.postOtaStatus(getDeviceSerial(), cmdId, status, errorCode));
     }
 
+    /** Sends a real-time OTA progress frame over the WebSocket (best-effort). */
+    private void sendOtaProgressFrame(String cmdId, String phase, int percent) {
+        if (cmdId == null || wsClient == null) return;
+        try {
+            JSONObject frame = new JSONObject();
+            frame.put("type", "ota_progress");
+            frame.put("command_id", cmdId);
+            frame.put("phase", phase);
+            frame.put("percent", percent);
+            wsClient.send(frame.toString());
+        } catch (Exception e) {
+            Log.e(TAG, "Failed to send OTA progress frame: " + e.getMessage());
+        }
+    }
+
+    /** OTA listener that reports against the current otaCommandId, so a duplicate command
+     *  can re-point status to the new id without restarting the in-flight update. */
+    private OtaUpdateManager.Listener buildOtaListener() {
+        return new OtaUpdateManager.Listener() {
+            @Override public void onDownloadProgress(String phase, int percent) {
+                updateNotificationIfNeeded("System update: " + phase + " " + percent + "%");
+                sendOtaProgressFrame(otaCommandId, phase, percent);
+            }
+            @Override public void onDownloadComplete() {
+                updateNotificationIfNeeded("System update: download complete, installing…");
+                reportOtaStatus(otaCommandId, "downloaded", null);
+            }
+            @Override public void onInstallComplete() {
+                updateNotificationIfNeeded("System update installed — awaiting reboot");
+                reportOtaStatus(otaCommandId, "installed", null);
+                otaCommandId = null;
+            }
+            @Override public void onError(String errorCode) {
+                updateNotificationIfNeeded("System update failed (" + errorCode + ")");
+                reportOtaStatus(otaCommandId, "error", errorCode);
+                otaCommandId = null;
+            }
+        };
+    }
+
     private void sendTelemetryOverWs() {
         if (wsClient == null || !wsClient.isConnected()) return;
         executor.submit(() -> {
@@ -544,49 +584,33 @@ public class MdmService extends Service {
                 break;
             }
             case "ota": {
-                String updateUrl = payload.optString("update_url", "");
+                final String updateUrl = payload.optString("update_url", "");
                 final String otaCmdId = cmdId;
-                final String otaSerial = serialNumber;
-                // Cancel any previous OTA before starting a new one
-                if (otaUpdateManager != null) {
-                    otaUpdateManager.cancel();
-                }
+                // Route subsequent OTA status/progress to the latest command id.
                 otaCommandId = otaCmdId;
                 if (otaUpdateManager == null) {
                     otaUpdateManager = new OtaUpdateManager(this, executor);
+                    otaUpdateManager.setListener(buildOtaListener());
                 }
-                otaUpdateManager.setListener(new OtaUpdateManager.Listener() {
-                    @Override public void onDownloadProgress(String phase, int percent) {
-                        updateNotificationIfNeeded("System update: " + phase + " " + percent + "%");
-                        // Send real-time progress via WebSocket
-                        if (wsClient != null) {
-                            try {
-                                JSONObject frame = new JSONObject();
-                                frame.put("type", "ota_progress");
-                                frame.put("command_id", otaCmdId);
-                                frame.put("phase", phase);
-                                frame.put("percent", percent);
-                                wsClient.send(frame.toString());
-                            } catch (Exception e) {
-                                Log.e(TAG, "Failed to send OTA progress frame: " + e.getMessage());
-                            }
-                        }
-                    }
-                    @Override public void onDownloadComplete() {
-                        updateNotificationIfNeeded("System update: download complete, installing…");
-                        reportOtaStatus(otaCmdId, "downloaded", null);
-                    }
-                    @Override public void onInstallComplete() {
-                        otaCommandId = null;
-                        updateNotificationIfNeeded("System update installed — awaiting reboot");
-                        reportOtaStatus(otaCmdId, "installed", null);
-                    }
-                    @Override public void onError(String errorCode) {
-                        otaCommandId = null;
-                        updateNotificationIfNeeded("System update failed (" + errorCode + ")");
-                        reportOtaStatus(otaCmdId, "error", errorCode);
-                    }
-                });
+                // Idempotent delivery: a duplicate "ota" command (e.g. a redeploy) must NOT
+                // restart an update that's already applied or in flight — restarting aborts
+                // update_engine and re-downloads from 0%. Only start fresh for a new package.
+                if (otaUpdateManager.isUpdatePendingReboot()) {
+                    // Already applied; the device just needs to reboot. Leave update_engine alone.
+                    Log.i(TAG, "OTA already applied, pending reboot — acking cmd " + otaCmdId);
+                    reportOtaStatus(otaCmdId, "installed", null);
+                    break;
+                }
+                if (otaUpdateManager.isActive() && updateUrl.equals(otaUpdateManager.getCurrentUrl())) {
+                    // Same package still downloading/installing: keep going, just surface the
+                    // current progress against the new command id.
+                    Log.i(TAG, "OTA already in progress for same URL — not restarting (cmd " + otaCmdId + ")");
+                    sendOtaProgressFrame(otaCmdId, otaUpdateManager.getCurrentPhase(),
+                            otaUpdateManager.getCurrentPercent());
+                    break;
+                }
+                // New or different package: cancel anything stale and start fresh.
+                otaUpdateManager.cancel();
                 otaUpdateManager.startUpdate(updateUrl);
                 break;
             }

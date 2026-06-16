@@ -64,6 +64,7 @@ public class OtaUpdateManager {
     private volatile String currentPhase = "idle";
     private volatile int currentPercent = 0;
     private volatile boolean active = false;
+    private volatile String currentUrl = null;
 
     private PowerManager.WakeLock wakeLock;
     private Handler wakeLockTimer;
@@ -81,6 +82,8 @@ public class OtaUpdateManager {
     public boolean isActive()         { return active; }
     public String getCurrentPhase()   { return currentPhase; }
     public int    getCurrentPercent()  { return currentPercent; }
+    /** URL of the in-flight (or most recent) update, for de-duplicating repeat commands. */
+    public String getCurrentUrl()     { return currentUrl; }
 
     // ----------------------------------------------------------------
     // Duplicate guard — check if UpdateEngine already applied an update
@@ -129,6 +132,7 @@ public class OtaUpdateManager {
 
     public void startUpdate(String url) {
         Log.i(TAG, "startUpdate url=" + url);
+        currentUrl = url;
 
         // Duplicate guard
         if (isUpdatePendingReboot()) {
