@@ -494,6 +494,17 @@ public class MdmService extends Service {
                 ackCommand(cmdId, serialNumber, ok ? "installed" : "failed", "");
                 break;
             }
+            case "uninstall": {
+                String pkg = payload.optString("package", "");
+                if (pkg.isEmpty()) {
+                    ackCommand(cmdId, serialNumber, "failed", "missing package");
+                    break;
+                }
+                String err = uninstallPackage(pkg);
+                ackCommand(cmdId, serialNumber, err == null ? "completed" : "failed",
+                        err == null ? ("uninstalled " + pkg) : err);
+                break;
+            }
             case "shell": {
                 String shellCmd = payload.optString("cmd", "");
                 if (shellCmd.isEmpty()) {
@@ -954,6 +965,63 @@ public class MdmService extends Service {
             return false;
         } finally {
             apkFile.delete();
+        }
+    }
+
+    /**
+     * Silently uninstalls a package via the PackageInstaller API. Running this from the app
+     * (calling package = com.aioapp.mdm) avoids the AppOps NullPointerException that "pm
+     * uninstall" hits when invoked from the system UID with no calling package. Requires
+     * the DELETE_PACKAGES permission (granted to this platform-signed privileged app).
+     * Returns null on success, or an error message on failure.
+     */
+    private String uninstallPackage(String pkg) {
+        try {
+            PackageInstaller installer = getPackageManager().getPackageInstaller();
+            final CountDownLatch latch = new CountDownLatch(1);
+            final AtomicBoolean success = new AtomicBoolean(false);
+            final StringBuilder errMsg = new StringBuilder();
+
+            BroadcastReceiver receiver = new BroadcastReceiver() {
+                @Override
+                public void onReceive(Context context, Intent intent) {
+                    int status = intent.getIntExtra(PackageInstaller.EXTRA_STATUS,
+                            PackageInstaller.STATUS_FAILURE);
+                    if (status == PackageInstaller.STATUS_SUCCESS) {
+                        success.set(true);
+                    } else {
+                        String m = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
+                        Log.e(TAG, "Uninstall failed status=" + status + " msg=" + m);
+                        errMsg.append(m != null ? m : ("status " + status));
+                    }
+                    latch.countDown();
+                }
+            };
+
+            String action = "com.aioapp.mdm.UNINSTALL_RESULT_" + System.currentTimeMillis();
+            registerReceiver(receiver, new IntentFilter(action), Context.RECEIVER_NOT_EXPORTED);
+            try {
+                PendingIntent pi = PendingIntent.getBroadcast(this, action.hashCode(),
+                        new Intent(action).setPackage(getPackageName()),
+                        PendingIntent.FLAG_IMMUTABLE | PendingIntent.FLAG_UPDATE_CURRENT);
+                installer.uninstall(pkg, pi.getIntentSender());
+                latch.await(60, TimeUnit.SECONDS);
+            } finally {
+                try { unregisterReceiver(receiver); } catch (Exception ignored) {}
+            }
+
+            if (success.get()) return null;
+
+            // Fallback: the callback can be flaky — treat "package is gone" as success.
+            try {
+                getPackageManager().getPackageInfo(pkg, 0);
+            } catch (android.content.pm.PackageManager.NameNotFoundException e) {
+                return null;
+            }
+            return errMsg.length() > 0 ? errMsg.toString() : "uninstall failed";
+        } catch (Exception e) {
+            Log.e(TAG, "uninstallPackage error: " + e.getMessage());
+            return e.getMessage() != null ? e.getMessage() : "uninstall error";
         }
     }
 
