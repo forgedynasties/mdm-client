@@ -96,6 +96,17 @@ public class MdmService extends Service {
     private long wlcLastMs = 0;
     private static final long WLC_CACHE_MS = 60_000;
 
+    // Battery lifecycle (sysfs): health % and charge cycle count change slowly.
+    private int cachedBatteryHealthPct = -1;
+    private int cachedBatteryCycleCount = -1;
+    private long batteryLifecycleLastMs = 0;
+    private static final long BATTERY_LIFECYCLE_CACHE_MS = 30 * 60_000L;
+
+    // Wi-Fi disconnect timestamps (epoch ms) over a trailing hour, for the
+    // frequent-disconnects alert. Appended on every NetworkCallback.onLost.
+    private final java.util.ArrayDeque<Long> wifiDisconnectTimes = new java.util.ArrayDeque<>();
+    private static final long WIFI_DISCONNECT_WINDOW_MS = 60 * 60_000L;
+
     // App list delta
     private String lastAppsHash = null;
     private volatile boolean sendFullAppList = false;
@@ -226,6 +237,7 @@ public class MdmService extends Service {
             public void onLost(Network network) {
                 networkAvailable = false;
                 Log.i(TAG, "Network lost");
+                recordWifiDisconnect();
             }
         };
         connectivityManager.registerNetworkCallback(request, networkCallback);
@@ -961,6 +973,16 @@ public class MdmService extends Service {
         extra.put("battery_temp_c", extractBatteryTemperature(batteryIntent));
         extra.put("charging", extractCharging(batteryIntent));
 
+        // Battery lifecycle (sysfs; -1 / JSONObject.NULL when unreadable).
+        populateBatteryLifecycle(extra);
+        // App / kiosk foreground state + recent crash/ANR counts for the pinned app.
+        populateAppKioskState(extra);
+        // Connectivity stability: Wi-Fi disconnects over the trailing hour.
+        extra.put("wifi_disconnects_1h", wifiDisconnectCount());
+        // System health: reboot reason (enriches the unexpected-reboot alert).
+        extra.put("boot_reason", SystemPropertiesProxy.get("sys.boot.reason",
+                SystemPropertiesProxy.get("ro.boot.bootreason", "")));
+
         // Include OTA progress if an update is in progress
         if (otaUpdateManager != null && otaUpdateManager.isActive() && otaCommandId != null) {
             JSONObject otaProgress = new JSONObject();
@@ -1025,6 +1047,7 @@ public class MdmService extends Service {
         if (cachedWifiExtra != null && now - wifiLastMs < WIFI_CACHE_MS) {
             extra.put("ip_address", cachedWifiExtra.opt("ip_address"));
             extra.put("wifi", cachedWifiExtra.opt("wifi"));
+            extra.put("wifi_rssi", cachedWifiExtra.opt("wifi_rssi"));
             return;
         }
         cachedWifiExtra = new JSONObject();
@@ -1032,21 +1055,25 @@ public class MdmService extends Service {
         if (wm == null || !wm.isWifiEnabled()) {
             cachedWifiExtra.put("ip_address", JSONObject.NULL);
             cachedWifiExtra.put("wifi", JSONObject.NULL);
+            cachedWifiExtra.put("wifi_rssi", JSONObject.NULL);
         } else {
             WifiInfo info = wm.getConnectionInfo();
             if (info == null) {
                 cachedWifiExtra.put("ip_address", JSONObject.NULL);
                 cachedWifiExtra.put("wifi", JSONObject.NULL);
+                cachedWifiExtra.put("wifi_rssi", JSONObject.NULL);
             } else {
                 int ip4 = info.getIpAddress();
                 cachedWifiExtra.put("ip_address", String.format("%d.%d.%d.%d",
                         ip4 & 0xff, (ip4 >> 8) & 0xff, (ip4 >> 16) & 0xff, (ip4 >> 24) & 0xff));
                 cachedWifiExtra.put("wifi", info.getSSID());
+                cachedWifiExtra.put("wifi_rssi", info.getRssi());
             }
         }
         wifiLastMs = now;
         extra.put("ip_address", cachedWifiExtra.opt("ip_address"));
         extra.put("wifi", cachedWifiExtra.opt("wifi"));
+        extra.put("wifi_rssi", cachedWifiExtra.opt("wifi_rssi"));
     }
 
     /** Non-blocking: writes the latest cached scan into the checkin extra. */
@@ -1182,6 +1209,128 @@ public class MdmService extends Service {
         cachedStorageFreeGb = Math.round(bytesAvailable / (1024.0 * 1024.0 * 1024.0) * 10.0) / 10.0;
         storageLastMs = now;
         return cachedStorageFreeGb;
+    }
+
+    /** Battery health % (charge_full / charge_full_design) and charge cycle count from
+     *  sysfs. Both change slowly, so the reads are cached. Reports JSONObject.NULL when a
+     *  node is missing/unreadable so the server never sees a bogus 0. */
+    private void populateBatteryLifecycle(JSONObject extra) throws JSONException {
+        long now = SystemClock.elapsedRealtime();
+        if (batteryLifecycleLastMs == 0 || now - batteryLifecycleLastMs >= BATTERY_LIFECYCLE_CACHE_MS) {
+            long full = readSysfsLong("/sys/class/power_supply/battery/charge_full");
+            long design = readSysfsLong("/sys/class/power_supply/battery/charge_full_design");
+            cachedBatteryHealthPct = (full > 0 && design > 0) ? (int) Math.round(full * 100.0 / design) : -1;
+            long cycles = readSysfsLong("/sys/class/power_supply/battery/cycle_count");
+            cachedBatteryCycleCount = cycles >= 0 ? (int) cycles : -1;
+            batteryLifecycleLastMs = now;
+        }
+        extra.put("battery_health_pct", cachedBatteryHealthPct >= 0 ? cachedBatteryHealthPct : JSONObject.NULL);
+        extra.put("battery_cycle_count", cachedBatteryCycleCount >= 0 ? cachedBatteryCycleCount : JSONObject.NULL);
+    }
+
+    private long readSysfsLong(String path) {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(path))) {
+            String line = r.readLine();
+            if (line == null) return -1;
+            return Long.parseLong(line.replace("\0", "").trim());
+        } catch (Exception e) {
+            return -1;
+        }
+    }
+
+    /** Foreground/kiosk state for the pinned ordering app, plus its recent crash/ANR
+     *  counts. The expected kiosk package + enabled flag come from the saved KioskManager
+     *  config, so the server can compare without knowing per-device kiosk settings. */
+    private void populateAppKioskState(JSONObject extra) throws JSONException {
+        JSONObject kioskCfg = KioskManager.loadConfig(this);
+        boolean kioskExpected = kioskCfg != null && kioskCfg.optBoolean("kiosk_enabled", false);
+        String kioskPkg = kioskCfg != null ? kioskCfg.optString("kiosk_package", "") : "";
+        extra.put("kiosk_expected", kioskExpected);
+        extra.put("kiosk_package", kioskPkg.isEmpty() ? JSONObject.NULL : kioskPkg);
+
+        boolean kioskActive = false;
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+            if (am != null) {
+                kioskActive = am.getLockTaskModeState() != android.app.ActivityManager.LOCK_TASK_MODE_NONE;
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "getLockTaskModeState error: " + e.getMessage());
+        }
+        extra.put("kiosk_active", kioskActive);
+
+        String fg = getForegroundPackage();
+        extra.put("foreground_pkg", fg == null ? JSONObject.NULL : fg);
+
+        // Crash/ANR counts for the pinned app (fall back to our own package if unset).
+        int[] counts = getProcessExitCounts(kioskPkg.isEmpty() ? getPackageName() : kioskPkg);
+        extra.put("crash_count_4h", counts[0]);
+        extra.put("anr_count_4h", counts[1]);
+    }
+
+    /** Top foreground package. Works because this app runs as the system UID; for a
+     *  non-system caller getRunningTasks would only return its own task. */
+    private String getForegroundPackage() {
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) return null;
+            List<android.app.ActivityManager.RunningTaskInfo> tasks = am.getRunningTasks(1);
+            if (tasks != null && !tasks.isEmpty() && tasks.get(0).topActivity != null) {
+                return tasks.get(0).topActivity.getPackageName();
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "getForegroundPackage error: " + e.getMessage());
+        }
+        return null;
+    }
+
+    /** Counts a package's crash and ANR exits in the last 4h via ApplicationExitInfo
+     *  (API 30+). Returns {crashes, anrs}; {0,0} on any error. */
+    private int[] getProcessExitCounts(String pkg) {
+        int crash = 0, anr = 0;
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null || pkg == null || pkg.isEmpty()) return new int[]{0, 0};
+            long cutoff = System.currentTimeMillis() - 4 * 60 * 60_000L;
+            List<android.app.ApplicationExitInfo> infos = am.getHistoricalProcessExitReasons(pkg, 0, 50);
+            for (android.app.ApplicationExitInfo info : infos) {
+                if (info.getTimestamp() < cutoff) continue;
+                int reason = info.getReason();
+                if (reason == android.app.ApplicationExitInfo.REASON_ANR) {
+                    anr++;
+                } else if (reason == android.app.ApplicationExitInfo.REASON_CRASH
+                        || reason == android.app.ApplicationExitInfo.REASON_CRASH_NATIVE) {
+                    crash++;
+                }
+            }
+        } catch (Exception e) {
+            Log.w(TAG, "getProcessExitCounts error: " + e.getMessage());
+        }
+        return new int[]{crash, anr};
+    }
+
+    private void recordWifiDisconnect() {
+        long now = System.currentTimeMillis();
+        synchronized (wifiDisconnectTimes) {
+            wifiDisconnectTimes.addLast(now);
+            pruneWifiDisconnects(now);
+        }
+    }
+
+    private int wifiDisconnectCount() {
+        long now = System.currentTimeMillis();
+        synchronized (wifiDisconnectTimes) {
+            pruneWifiDisconnects(now);
+            return wifiDisconnectTimes.size();
+        }
+    }
+
+    /** Caller must hold the wifiDisconnectTimes monitor. */
+    private void pruneWifiDisconnects(long now) {
+        while (!wifiDisconnectTimes.isEmpty()
+                && now - wifiDisconnectTimes.peekFirst() > WIFI_DISCONNECT_WINDOW_MS) {
+            wifiDisconnectTimes.pollFirst();
+        }
     }
 
     private void registerPackageChangeReceiver() {
