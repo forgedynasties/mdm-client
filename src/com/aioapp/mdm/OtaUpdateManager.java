@@ -34,7 +34,7 @@ import java.util.concurrent.TimeUnit;
 public class OtaUpdateManager {
     private static final String TAG = "OtaUpdateManager";
 
-    private static final int PROGRESS_REPORT_STEP = 5;
+    private static final int PROGRESS_REPORT_STEP = 1;
     private static final String OTA_PACKAGE_DIR = "/data/ota_package";
     private static final String OTA_PACKAGE_PATH = OTA_PACKAGE_DIR + "/update.zip";
     private static final String TEMP_FILE_NAME = "update_temp.zip";
