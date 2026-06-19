@@ -62,6 +62,8 @@ public class MdmService extends Service {
     private OtaUpdateManager otaUpdateManager;
     private volatile String otaCommandId;  // set while an OTA is in progress
     private volatile boolean isCapturing = false;
+    private android.os.PowerManager.WakeLock remoteWakeLock;  // keeps the screen on during a remote session
+    private static final long REMOTE_WAKE_TIMEOUT_MS = 30 * 60 * 1000L;  // safety cap so a dropped session can't pin the screen
     private MdmWebSocketClient wsClient;
     private JSONArray cachedInstalledApps = null;
     private BroadcastReceiver packageChangeReceiver;
@@ -468,12 +470,17 @@ public class MdmService extends Service {
                     int maxFps = msg.optInt("max_fps", 10);
                     if (!isCapturing) {
                         isCapturing = true;
+                        acquireRemoteWakeLock();
                         runCaptureLoop(quality, scale, maxFps);
                     }
                 });
                 break;
             case "stop_capture":
                 isCapturing = false;
+                releaseRemoteWakeLock();
+                break;
+            case "wake_screen":
+                wakeScreen(null);
                 break;
             default:
                 Log.w(TAG, "Unknown WS message type: " + type);
@@ -646,6 +653,7 @@ public class MdmService extends Service {
                 int maxFps = payload.optInt("max_fps", 10);
                 if (!isCapturing) {
                     isCapturing = true;
+                    acquireRemoteWakeLock();
                     executor.submit(() -> runCaptureLoop(quality, scale, maxFps));
                 }
                 ackCommand(cmdId, serialNumber, "completed", "");
@@ -653,6 +661,7 @@ public class MdmService extends Service {
             }
             case "stop_capture": {
                 isCapturing = false;
+                releaseRemoteWakeLock();
                 ackCommand(cmdId, serialNumber, "completed", "");
                 break;
             }
@@ -706,7 +715,58 @@ public class MdmService extends Service {
             }
         }
         isCapturing = false;
+        releaseRemoteWakeLock();
         Log.i(TAG, "Capture loop stopped");
+    }
+
+    /**
+     * Turns the display on and holds it bright for the duration of a remote-control
+     * session. Called at session start so the operator never connects to a dark or
+     * sleeping screen. Safe to call repeatedly — re-arms the safety timeout.
+     */
+    private void acquireRemoteWakeLock() {
+        try {
+            android.os.PowerManager pm =
+                    (android.os.PowerManager) getSystemService(Context.POWER_SERVICE);
+            wakeScreen(pm);
+            if (remoteWakeLock == null) {
+                remoteWakeLock = pm.newWakeLock(
+                        android.os.PowerManager.SCREEN_BRIGHT_WAKE_LOCK
+                                | android.os.PowerManager.ACQUIRE_CAUSES_WAKEUP,
+                        "MDM:RemoteControl");
+                remoteWakeLock.setReferenceCounted(false);
+            }
+            remoteWakeLock.acquire(REMOTE_WAKE_TIMEOUT_MS);
+            Log.i(TAG, "Remote wake lock acquired (" + REMOTE_WAKE_TIMEOUT_MS + "ms)");
+        } catch (Exception e) {
+            Log.e(TAG, "acquireRemoteWakeLock failed: " + e.getMessage());
+        }
+    }
+
+    private void releaseRemoteWakeLock() {
+        try {
+            if (remoteWakeLock != null && remoteWakeLock.isHeld()) {
+                remoteWakeLock.release();
+                Log.i(TAG, "Remote wake lock released");
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "releaseRemoteWakeLock failed: " + e.getMessage());
+        }
+    }
+
+    /** Forces the display on (used at session start and on operator right-click). */
+    private void wakeScreen(android.os.PowerManager pm) {
+        try {
+            if (pm == null) {
+                pm = (android.os.PowerManager) getSystemService(Context.POWER_SERVICE);
+            }
+            java.lang.reflect.Method wakeUp = android.os.PowerManager.class.getMethod(
+                    "wakeUp", long.class);
+            wakeUp.invoke(pm, android.os.SystemClock.uptimeMillis());
+        } catch (Exception e) {
+            // wakeUp() is a hidden API; the ACQUIRE_CAUSES_WAKEUP wake-lock flag is the fallback.
+            Log.w(TAG, "PowerManager.wakeUp() unavailable: " + e.getMessage());
+        }
     }
 
     private android.graphics.Bitmap captureScreen(int w, int h, int rotation) {
@@ -1507,6 +1567,7 @@ public class MdmService extends Service {
     @Override
     public void onDestroy() {
         isCapturing = false;
+        releaseRemoteWakeLock();
         alarmManager.cancel(pollIntent);
         if (pollReceiver != null) {
             try { unregisterReceiver(pollReceiver); } catch (Exception ignored) {}
