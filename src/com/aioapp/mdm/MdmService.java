@@ -89,7 +89,14 @@ public class MdmService extends Service {
 
     private int cachedWlcStatus = -1;
     private long wlcLastMs = 0;
-    private static final long WLC_CACHE_MS = 60_000;
+    private static final long WLC_CACHE_MS = 120_000;
+
+    // Crash/ANR counts scan a 4h history window and barely change — cache between checkins.
+    private int cachedCrashCount = 0;
+    private int cachedAnrCount = 0;
+    private String processExitPkg = "";
+    private long processExitLastMs = 0;
+    private static final long PROCESS_EXIT_CACHE_MS = 5 * 60_000L;
 
     // Battery lifecycle (sysfs): health % and charge cycle count change slowly.
     private int cachedBatteryHealthPct = -1;
@@ -1260,6 +1267,13 @@ public class MdmService extends Service {
     private int getWlcStatus() {
         long now = SystemClock.elapsedRealtime();
         if (wlcLastMs > 0 && now - wlcLastMs < WLC_CACHE_MS) return cachedWlcStatus;
+        // On battery there is no charging at all, so the wireless pad is necessarily
+        // disconnected — skip the ~500ms blocking GPIO poll entirely.
+        if (!isOnExternalPower()) {
+            cachedWlcStatus = 0;
+            wlcLastMs = now;
+            return cachedWlcStatus;
+        }
         final String gpioPath = "/sys/devices/platform/soc/soc:customer_gpio/gpio27";
         final long windowMs = 500;
         final long stepMs = 10;
@@ -1377,6 +1391,11 @@ public class MdmService extends Service {
     /** Counts a package's crash and ANR exits in the last 4h via ApplicationExitInfo
      *  (API 30+). Returns {crashes, anrs}; {0,0} on any error. */
     private int[] getProcessExitCounts(String pkg) {
+        long nowMs = SystemClock.elapsedRealtime();
+        if (processExitLastMs > 0 && nowMs - processExitLastMs < PROCESS_EXIT_CACHE_MS
+                && pkg != null && pkg.equals(processExitPkg)) {
+            return new int[]{cachedCrashCount, cachedAnrCount};
+        }
         int crash = 0, anr = 0;
         try {
             android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
@@ -1396,6 +1415,10 @@ public class MdmService extends Service {
         } catch (Exception e) {
             Log.w(TAG, "getProcessExitCounts error: " + e.getMessage());
         }
+        cachedCrashCount = crash;
+        cachedAnrCount = anr;
+        processExitPkg = pkg;
+        processExitLastMs = nowMs;
         return new int[]{crash, anr};
     }
 
