@@ -155,6 +155,14 @@ public class MdmApiService {
         PostResult(int code, String body) { this.code = code; this.body = body; }
     }
 
+    private static byte[] gzip(byte[] data) throws java.io.IOException {
+        java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(data.length / 2);
+        try (java.util.zip.GZIPOutputStream gz = new java.util.zip.GZIPOutputStream(bos)) {
+            gz.write(data);
+        }
+        return bos.toByteArray();
+    }
+
     private PostResult doPost(String endpoint, String jsonBody) throws Exception {
         URL url = new URL(apiBaseUrl + endpoint);
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
@@ -164,8 +172,16 @@ public class MdmApiService {
         conn.setDoOutput(true);
         conn.setConnectTimeout(10_000);
         conn.setReadTimeout(30_000);
+        byte[] payload = jsonBody.getBytes(StandardCharsets.UTF_8);
+        // Gzip only payloads big enough to win (check-ins); tiny bodies (acks) would
+        // grow. The server inflates Content-Encoding: gzip transparently.
+        if (payload.length > 512) {
+            payload = gzip(payload);
+            conn.setRequestProperty("Content-Encoding", "gzip");
+        }
+        conn.setFixedLengthStreamingMode(payload.length);
         try (OutputStream os = conn.getOutputStream()) {
-            os.write(jsonBody.getBytes(StandardCharsets.UTF_8));
+            os.write(payload);
         }
         int code = conn.getResponseCode();
         StringBuilder sb = new StringBuilder();
