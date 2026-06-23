@@ -180,10 +180,35 @@ public class MdmService extends Service {
         return START_STICKY;
     }
 
+    /** True when the device is on external power (wired or wireless pad). */
+    private boolean isOnExternalPower() {
+        Intent b = getBatteryIntent();
+        return b != null && b.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0) != 0;
+    }
+
     private void scheduleNextPoll() {
         long intervalMs = getAdaptivePollInterval() * apiService.getBackoffMultiplier();
-        alarmManager.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP,
-                SystemClock.elapsedRealtime() + intervalMs, pollIntent);
+
+        boolean powered = isOnExternalPower();
+        boolean wsHealthy = wsClient != null && wsClient.isConnected()
+                && wsClient.getSecsSinceLastSend() <= STALE_WS_THRESHOLD_SECS;
+
+        // On battery with a healthy WebSocket, the WS keepalive thread (which uses no alarm
+        // of its own) already carries presence + pushed commands and self-reconnects, so the
+        // wakeup alarm only needs to fire at the HTTP safety-net cadence — this drops the
+        // ~9/10 Doze wakeups that previously only re-sent a WS telemetry frame.
+        if (!powered && wsHealthy) {
+            intervalMs = Math.max(intervalMs, HTTP_SAFETY_NET_MS);
+        }
+
+        long triggerAt = SystemClock.elapsedRealtime() + intervalMs;
+        if (powered) {
+            // Powered (kiosk on a charger): keep exact, responsive wakeups.
+            alarmManager.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pollIntent);
+        } else {
+            // On battery: inexact so the OS can batch this wakeup with other Doze maintenance.
+            alarmManager.setAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pollIntent);
+        }
     }
 
     private void ensureDeviceOwner() {
@@ -1448,9 +1473,9 @@ public class MdmService extends Service {
         int level = battery.getIntExtra(BatteryManager.EXTRA_LEVEL, -1);
         int scale = battery.getIntExtra(BatteryManager.EXTRA_SCALE, -1);
         int pct = (scale > 0 && level >= 0) ? (int) ((level / (float) scale) * 100) : 100;
-        if (pct <= 15) return base * 4;  // critical battery: poll 4× less often
-        if (pct <= 30) return base * 2;  // low battery: poll 2× less often
-        if (!interactive) return base * 2; // screen off, not charging, not low battery
+        if (pct <= 15) return base * 6;  // critical battery: poll far less often
+        if (pct <= 30) return base * 3;  // low battery: poll less often
+        if (!interactive) return base * 4; // screen off, not charging: nobody's watching
         return base;
     }
 
