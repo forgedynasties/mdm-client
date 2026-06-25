@@ -104,6 +104,15 @@ public class MdmService extends Service {
     private String lastAppsHash = null;
     private volatile boolean sendFullAppList = false;
 
+    // Telemetry delta baseline: what the server was last told. A WS frame carries only the
+    // gated fields that changed (others are merged server-side from this baseline); a send is
+    // skipped entirely when nothing changed. forceKeyframe makes the next send a full snapshot
+    // (on start, WS (re)connect, and after a failed send) to (re)establish the baseline.
+    private final Object baselineLock = new Object();
+    private JSONObject lastSentExtra = null;          // guarded by baselineLock
+    private int lastSentBattery = Integer.MIN_VALUE;  // guarded by baselineLock
+    private volatile boolean forceKeyframe = true;
+
     // Connection health
     private static final long HTTP_SAFETY_NET_MS = 5 * 60_000L;
     private static final long STALE_WS_THRESHOLD_SECS = 120;
@@ -196,7 +205,7 @@ public class MdmService extends Service {
 
         boolean powered = isOnExternalPower();
         boolean wsHealthy = wsClient != null && wsClient.isConnected()
-                && wsClient.getSecsSinceLastSend() <= STALE_WS_THRESHOLD_SECS;
+                && wsClient.getSecsSinceLastData() <= STALE_WS_THRESHOLD_SECS;
 
         // On battery with a healthy WebSocket, the WS keepalive thread (which uses no alarm
         // of its own) already carries presence + pushed commands and self-reconnects, so the
@@ -272,10 +281,11 @@ public class MdmService extends Service {
     private void performCheckin() {
         long now = System.currentTimeMillis();
         if (wsClient != null && wsClient.isConnected()) {
-            // Detect stale WS: appears connected but nothing sent in >2 minutes
-            long staleSecs = wsClient.getSecsSinceLastSend();
+            // Liveness is gauged by data *received* (server keepalive pings every ~45s), not by
+            // how often we send — with change-gated telemetry a healthy link can be quiet.
+            long staleSecs = wsClient.getSecsSinceLastData();
             if (staleSecs > STALE_WS_THRESHOLD_SECS) {
-                Log.w(TAG, "WS stale for " + staleSecs + "s, forcing reconnect");
+                Log.w(TAG, "WS stale (no data " + staleSecs + "s), forcing reconnect");
                 wsClient.forceReconnect();
             } else {
                 sendTelemetryOverWs();
@@ -290,6 +300,8 @@ public class MdmService extends Service {
                     JSONObject payload = buildCheckinPayload();
                     JSONObject response = apiService.checkin(payload);
                     if (response != null) {
+                        // Keyframe landed — reset the delta baseline to this full snapshot.
+                        rememberSent(payload.getJSONObject("extra"), payload.getInt("battery_pct"));
                         if (response.optBoolean("send_apps", false)) sendFullAppList = true;
                         JSONObject config = response.optJSONObject("config");
                         if (config != null) applyConfig(config);
@@ -402,15 +414,30 @@ public class MdmService extends Service {
         if (wsClient == null || !wsClient.isConnected()) return;
         executor.submit(() -> {
             try {
-                JSONObject payload = buildCheckinPayload();
+                JSONObject curExtra = buildExtra();
+                int curBattery = extractBatteryPct(getBatteryIntent());
+                boolean keyframe = forceKeyframe;
+                if (!keyframe) {
+                    synchronized (baselineLock) {
+                        if (lastSentBattery == curBattery && !gatedChanged(curExtra) && !tempTrigger(curExtra)) {
+                            return; // nothing changed — skip the send entirely
+                        }
+                    }
+                }
+                JSONObject payload = keyframe
+                        ? buildCheckinPayload()
+                        : buildDeltaPayload(curExtra, curBattery);
                 payload.put("type", "telemetry");
                 wsClient.send(payload.toString());
+                rememberSent(curExtra, curBattery);
             } catch (Exception e) {
+                forceKeyframe = true; // next send re-establishes the full baseline
                 Log.e(TAG, "WS telemetry failed, falling back to HTTP: " + e.getMessage());
                 try {
                     JSONObject payload = buildCheckinPayload();
                     JSONObject response = apiService.checkin(payload);
                     if (response != null) {
+                        rememberSent(payload.getJSONObject("extra"), payload.getInt("battery_pct"));
                         JSONObject config = response.optJSONObject("config");
                         if (config != null) applyConfig(config);
                     }
@@ -432,7 +459,8 @@ public class MdmService extends Service {
         String serial = getDeviceSerial();
         wsClient = new MdmWebSocketClient(apiService.getApiBaseUrl(), serial, apiService.getApiKey());
         wsClient.setListener(this::handleWsMessage);
-        wsClient.setConnectedCallback(this::sendTelemetryOverWs);
+        // On every (re)connect the server has no baseline for us — send a full keyframe.
+        wsClient.setConnectedCallback(() -> { forceKeyframe = true; sendTelemetryOverWs(); });
         wsClient.start();
         Log.i(TAG, "WebSocket client started");
     }
@@ -1140,16 +1168,9 @@ public class MdmService extends Service {
         return apps;
     }
 
-    private JSONObject buildCheckinPayload() throws JSONException {
-        JSONObject payload = new JSONObject();
-
-        payload.put("serial_number", getDeviceSerial());
-        payload.put("build_id", SystemPropertiesProxy.get("ro.build.id", Build.UNKNOWN));
-
-        // Read battery intent once; extract both pct and temp from the same object
+    /** Builds the current full telemetry "extra" — a complete snapshot of every field. */
+    private JSONObject buildExtra() throws JSONException {
         Intent batteryIntent = getBatteryIntent();
-        payload.put("battery_pct", extractBatteryPct(batteryIntent));
-
         JSONObject extra = new JSONObject();
         populateWifiInfo(extra);
         extra.put("storage_free_gb", getStorageFreeGb());
@@ -1159,11 +1180,9 @@ public class MdmService extends Service {
         extra.put("timezone", java.util.TimeZone.getDefault().getID());
         extra.put("battery_temp_c", extractBatteryTemperature(batteryIntent));
         extra.put("charging", extractCharging(batteryIntent));
-
-        // System health: reboot reason (enriches the unexpected-reboot alert).
+        // System health: reboot reason.
         extra.put("boot_reason", SystemPropertiesProxy.get("sys.boot.reason",
                 SystemPropertiesProxy.get("ro.boot.bootreason", "")));
-
         // Include OTA progress if an update is in progress
         if (otaUpdateManager != null && otaUpdateManager.isActive() && otaCommandId != null) {
             JSONObject otaProgress = new JSONObject();
@@ -1172,8 +1191,21 @@ public class MdmService extends Service {
             otaProgress.put("percent", otaUpdateManager.getCurrentPercent());
             extra.put("ota_progress", otaProgress);
         }
+        return extra;
+    }
 
-        payload.put("extra", extra);
+    private String currentBuildId() {
+        return SystemPropertiesProxy.get("ro.build.id", Build.UNKNOWN);
+    }
+
+    /** Full keyframe payload (HTTP check-in + forced WS resync): complete snapshot + app
+     *  inventory delta. The server replaces latest_extra from this, clearing any stale keys. */
+    private JSONObject buildCheckinPayload() throws JSONException {
+        JSONObject payload = new JSONObject();
+        payload.put("serial_number", getDeviceSerial());
+        payload.put("build_id", currentBuildId());
+        payload.put("battery_pct", extractBatteryPct(getBatteryIntent()));
+        payload.put("extra", buildExtra());
 
         // Send full app list only when packages changed or server explicitly requests it
         JSONArray apps = getCachedInstalledApps();
@@ -1184,8 +1216,75 @@ public class MdmService extends Service {
             sendFullAppList = false;
         }
         payload.put("apps_hash", currentHash);
-
         return payload;
+    }
+
+    // ── Delta telemetry ──────────────────────────────────────────────────────────
+    // Gated keys: a change in any of these (or battery_pct, or a temperature trigger) is what
+    // makes us transmit a WS frame; unchanged gated keys are omitted (server keeps the prior
+    // value via merge). Volatile keys are always included in any frame we do send.
+    private static final String[] GATED_EXTRA_KEYS = {
+            "charging", "storage_free_gb", "wlc_status", "wifi", "ip_address",
+            "timezone", "boot_reason"
+    };
+    private static final String[] VOLATILE_EXTRA_KEYS = {
+            "battery_temp_c", "ram_usage_mb", "uptime_seconds", "wifi_rssi", "ota_progress"
+    };
+
+    /** Delta payload: the volatile set + any changed gated fields; battery_pct only if changed. */
+    private JSONObject buildDeltaPayload(JSONObject curExtra, int curBattery) throws JSONException {
+        JSONObject payload = new JSONObject();
+        payload.put("serial_number", getDeviceSerial());
+        payload.put("build_id", currentBuildId()); // identity — always present
+        JSONObject extra = new JSONObject();
+        for (String k : VOLATILE_EXTRA_KEYS) {
+            if (curExtra.has(k)) extra.put(k, curExtra.get(k));
+        }
+        synchronized (baselineLock) {
+            for (String k : GATED_EXTRA_KEYS) {
+                if (!sameAsBaseline(k, curExtra)) extra.put(k, curExtra.get(k));
+            }
+            if (lastSentBattery != curBattery) payload.put("battery_pct", curBattery);
+        }
+        payload.put("extra", extra);
+        return payload;
+    }
+
+    /** Caller holds baselineLock. True when key's current value equals the last sent value. */
+    private boolean sameAsBaseline(String key, JSONObject curExtra) {
+        if (lastSentExtra == null) return false;
+        return String.valueOf(lastSentExtra.opt(key)).equals(String.valueOf(curExtra.opt(key)));
+    }
+
+    /** Caller holds baselineLock. Any gated field changed since the last successful send? */
+    private boolean gatedChanged(JSONObject curExtra) {
+        if (lastSentExtra == null) return true;
+        for (String k : GATED_EXTRA_KEYS) {
+            if (!sameAsBaseline(k, curExtra)) return true;
+        }
+        return false;
+    }
+
+    /** Temperature moved enough to warrant an out-of-band push (keeps thermal alerts fresh). */
+    private boolean tempTrigger(JSONObject curExtra) {
+        if (lastSentExtra == null) return true;
+        double cur = curExtra.optDouble("battery_temp_c", -999);
+        double prev = lastSentExtra.optDouble("battery_temp_c", -999);
+        if (prev <= -999) return true;
+        if (Math.abs(cur - prev) >= 2.0) return true;
+        return tempBand(cur) != tempBand(prev);
+    }
+
+    private int tempBand(double c) { return c >= 45 ? 2 : (c >= 38 ? 1 : 0); }
+
+    /** Record what the server now knows, after a confirmed send. */
+    private void rememberSent(JSONObject extra, int battery) {
+        synchronized (baselineLock) {
+            try { lastSentExtra = new JSONObject(extra.toString()); }
+            catch (JSONException e) { lastSentExtra = null; }
+            lastSentBattery = battery;
+        }
+        forceKeyframe = false;
     }
 
     private String getDeviceSerial() {

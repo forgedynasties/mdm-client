@@ -287,6 +287,14 @@ public class MdmWebSocketClient {
         return (System.currentTimeMillis() - lastSendAt) / 1000;
     }
 
+    /** Seconds since the last frame received from the server (incl. its keepalive pings).
+     *  A liveness signal independent of how often *we* send — the right health proxy once
+     *  the client only transmits on change. */
+    public long getSecsSinceLastData() {
+        if (lastDataReceivedAt == 0) return 0;
+        return (System.currentTimeMillis() - lastDataReceivedAt) / 1000;
+    }
+
     /** Sends a masked WebSocket frame. Client → server frames must always be masked per RFC 6455. */
     private void startPingWatchdog() {
         Thread t = new Thread(() -> {
