@@ -185,11 +185,17 @@ public class MdmApiService {
         }
         int code = conn.getResponseCode();
         StringBuilder sb = new StringBuilder();
-        try (BufferedReader br = new BufferedReader(
-                new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
-            String line;
-            while ((line = br.readLine()) != null) sb.append(line);
-        } catch (Exception ignored) {}
+        // On an error code getInputStream() throws; read getErrorStream() instead so the
+        // body is drained and HttpURLConnection can keep the socket alive for reuse (a
+        // dropped error stream forces a fresh TCP+TLS handshake on the next request).
+        java.io.InputStream stream = code >= 400 ? conn.getErrorStream() : conn.getInputStream();
+        if (stream != null) {
+            try (BufferedReader br = new BufferedReader(
+                    new InputStreamReader(stream, StandardCharsets.UTF_8))) {
+                String line;
+                while ((line = br.readLine()) != null) sb.append(line);
+            } catch (Exception ignored) {}
+        }
         return new PostResult(code, sb.toString());
     }
 }

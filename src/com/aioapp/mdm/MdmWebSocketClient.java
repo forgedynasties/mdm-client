@@ -4,7 +4,6 @@ import android.util.Base64;
 import android.util.Log;
 import org.json.JSONObject;
 
-import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
 import java.io.IOException;
 import java.io.InputStream;
@@ -39,6 +38,10 @@ public class MdmWebSocketClient {
     private final boolean useTls;
     private final String wsPath; // e.g. /api/v1/ws?serial=DEVICE-001
     private final String apiKey;
+
+    // One reused RNG for per-frame masking — constructing a SecureRandom per frame
+    // (re-seeding each time) is expensive and needless on the binary capture hot path.
+    private final SecureRandom secureRandom = new SecureRandom();
 
     private Listener listener;
     private ConnectedCallback connectedCallback;
@@ -151,7 +154,7 @@ public class MdmWebSocketClient {
 
         // --- HTTP Upgrade handshake ---
         byte[] keyBytes = new byte[16];
-        new SecureRandom().nextBytes(keyBytes);
+        secureRandom.nextBytes(keyBytes);
         String wsKey = Base64.encodeToString(keyBytes, Base64.NO_WRAP);
 
         boolean defaultPort = (useTls && port == 443) || (!useTls && port == 80);
@@ -321,28 +324,31 @@ public class MdmWebSocketClient {
         OutputStream out = this.outputStream;
         if (out == null) throw new IOException("not connected");
         try {
-            byte[] mask = new byte[4];
-            new SecureRandom().nextBytes(mask);
-            byte[] maskedPayload = new byte[payload.length];
-            for (int i = 0; i < payload.length; i++) maskedPayload[i] = (byte) (payload[i] ^ mask[i % 4]);
-
-            ByteArrayOutputStream buf = new ByteArrayOutputStream(payload.length + 10);
-            buf.write(0x80 | opcode); // FIN=1
-            if (payload.length < 126) {
-                buf.write(0x80 | payload.length);
-            } else if (payload.length < 65536) {
-                buf.write(0x80 | 126);
-                buf.write((payload.length >> 8) & 0xFF);
-                buf.write(payload.length & 0xFF);
+            int len = payload.length;
+            int headerLen = 2 + (len < 126 ? 0 : (len < 65536 ? 2 : 8)) + 4; // + 4-byte mask
+            // Single allocation for the whole frame; mask is applied straight into it
+            // (vs. the old maskedPayload + ByteArrayOutputStream + toByteArray() per frame).
+            byte[] frame = new byte[headerLen + len];
+            int pos = 0;
+            frame[pos++] = (byte) (0x80 | opcode); // FIN=1
+            if (len < 126) {
+                frame[pos++] = (byte) (0x80 | len);
+            } else if (len < 65536) {
+                frame[pos++] = (byte) (0x80 | 126);
+                frame[pos++] = (byte) ((len >> 8) & 0xFF);
+                frame[pos++] = (byte) (len & 0xFF);
             } else {
-                buf.write(0x80 | 127);
-                long len = payload.length;
-                for (int i = 7; i >= 0; i--) buf.write((int) ((len >> (i * 8)) & 0xFF));
+                frame[pos++] = (byte) (0x80 | 127);
+                long llen = len;
+                for (int i = 7; i >= 0; i--) frame[pos++] = (byte) ((llen >> (i * 8)) & 0xFF);
             }
-            buf.write(mask);
-            buf.write(maskedPayload);
+            byte[] mask = new byte[4];
+            secureRandom.nextBytes(mask);
+            System.arraycopy(mask, 0, frame, pos, 4);
+            pos += 4;
+            for (int i = 0; i < len; i++) frame[pos + i] = (byte) (payload[i] ^ mask[i & 3]);
             synchronized (out) {
-                out.write(buf.toByteArray());
+                out.write(frame);
                 out.flush();
             }
         } catch (IOException e) {

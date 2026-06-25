@@ -33,6 +33,7 @@ import java.util.Set;
 import java.util.zip.CRC32;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -65,7 +66,15 @@ public class MdmService extends Service {
     private JSONArray cachedInstalledApps = null;
     private BroadcastReceiver packageChangeReceiver;
     private String lastNotificationText = "";
+    // Control-plane pool: short tasks (check-ins, telemetry, acks, config, input, pings).
     private ExecutorService executor;
+    // Heavy pool: long-running ops (commands, logcat, OTA download, screen capture) so they
+    // never occupy the control-plane pool and starve/drop a telemetry or ack task.
+    private ExecutorService heavyExecutor;
+    private String deviceSerial;  // cached; Build.getSerial() is a binder call and never changes
+    // Cached reflected SurfaceControl.screenshot — looked up once, not per capture frame.
+    private volatile java.lang.reflect.Method screenshotMethod;
+    private volatile boolean screenshotMethodResolved;
 
     // Battery: registered once in onCreate, updated via sticky broadcast
     private volatile Intent cachedBatteryIntent = null;
@@ -120,8 +129,15 @@ public class MdmService extends Service {
     @Override
     public void onCreate() {
         super.onCreate();
+        // CallerRunsPolicy applies backpressure instead of silently discarding a queued
+        // ack/telemetry task if the pool ever saturates. Long ops live on heavyExecutor.
         executor = new ThreadPoolExecutor(2, 4, 60, TimeUnit.SECONDS,
-                new LinkedBlockingQueue<>(16), new ThreadPoolExecutor.DiscardOldestPolicy());
+                new LinkedBlockingQueue<>(32), new ThreadPoolExecutor.CallerRunsPolicy());
+        heavyExecutor = Executors.newCachedThreadPool(r -> {
+            Thread t = new Thread(r, "mdm-heavy");
+            t.setDaemon(true);
+            return t;
+        });
         apiService = new MdmApiService();
         connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
@@ -425,14 +441,14 @@ public class MdmService extends Service {
         String type = msg.optString("type", "");
         switch (type) {
             case "command":
-                executor.submit(() -> {
+                heavyExecutor.submit(() -> {
                     try { processWsCommand(msg); } catch (Exception e) {
                         Log.e(TAG, "WS command error: " + e.getMessage());
                     }
                 });
                 break;
             case "logcat_request":
-                executor.submit(() -> {
+                heavyExecutor.submit(() -> {
                     try { processWsLogcatRequest(msg); } catch (Exception e) {
                         Log.e(TAG, "WS logcat error: " + e.getMessage());
                     }
@@ -468,7 +484,7 @@ public class MdmService extends Service {
                 });
                 break;
             case "start_capture":
-                executor.submit(() -> {
+                heavyExecutor.submit(() -> {
                     int quality = msg.optInt("quality", 60);
                     double scale = msg.optDouble("scale", 0.5);
                     int maxFps = msg.optInt("max_fps", 10);
@@ -541,14 +557,16 @@ public class MdmService extends Service {
                     } catch (Exception ignored) {}
                 });
                 stderrThread.start();
-                // Stream stdout chunks via WebSocket so the browser sees them immediately
+                // Stream stdout chunks via WebSocket so the browser sees them immediately.
+                // `collected` only backs the HTTP ack, so cap it (the WS stream is unbounded).
+                final int MAX_COLLECTED = 1024 * 1024;
                 StringBuilder collected = new StringBuilder();
                 try (InputStream is = p.getInputStream()) {
                     byte[] buf = new byte[4096];
                     int n;
                     while ((n = is.read(buf)) != -1) {
                         String chunk = new String(buf, 0, n, StandardCharsets.UTF_8);
-                        collected.append(chunk);
+                        if (collected.length() < MAX_COLLECTED) collected.append(chunk);
                         JSONObject outFrame = new JSONObject();
                         outFrame.put("type", "command_output");
                         outFrame.put("command_id", cmdId);
@@ -611,7 +629,7 @@ public class MdmService extends Service {
                 // Route subsequent OTA status/progress to the latest command id.
                 otaCommandId = otaCmdId;
                 if (otaUpdateManager == null) {
-                    otaUpdateManager = new OtaUpdateManager(this, executor);
+                    otaUpdateManager = new OtaUpdateManager(this, heavyExecutor);
                     otaUpdateManager.setListener(buildOtaListener());
                 }
                 // Idempotent delivery: a duplicate "ota" command (e.g. a redeploy) must NOT
@@ -658,7 +676,7 @@ public class MdmService extends Service {
                 if (!isCapturing) {
                     isCapturing = true;
                     acquireRemoteWakeLock();
-                    executor.submit(() -> runCaptureLoop(quality, scale, maxFps));
+                    heavyExecutor.submit(() -> runCaptureLoop(quality, scale, maxFps));
                 }
                 ackCommand(cmdId, serialNumber, "completed", "");
                 break;
@@ -774,9 +792,23 @@ public class MdmService extends Service {
     }
 
     private android.graphics.Bitmap captureScreen(int w, int h, int rotation) {
+        java.lang.reflect.Method method = screenshotMethod;
+        if (method == null && !screenshotMethodResolved) {
+            synchronized (this) {
+                if (!screenshotMethodResolved) {
+                    try {
+                        screenshotMethod = android.view.SurfaceControl.class.getMethod(
+                                "screenshot", android.graphics.Rect.class, int.class, int.class, int.class);
+                    } catch (Exception e) {
+                        Log.w(TAG, "SurfaceControl.screenshot() unavailable: " + e.getMessage());
+                    }
+                    screenshotMethodResolved = true;
+                }
+            }
+            method = screenshotMethod;
+        }
+        if (method == null) return captureScreenFallback(w, h);
         try {
-            java.lang.reflect.Method method = android.view.SurfaceControl.class.getMethod(
-                    "screenshot", android.graphics.Rect.class, int.class, int.class, int.class);
             return (android.graphics.Bitmap) method.invoke(null,
                     new android.graphics.Rect(), w, h, rotation);
         } catch (Exception e) {
@@ -1157,11 +1189,14 @@ public class MdmService extends Service {
     }
 
     private String getDeviceSerial() {
-        try {
-            return Build.getSerial();
-        } catch (SecurityException e) {
-            return Build.UNKNOWN;
+        if (deviceSerial == null) {
+            try {
+                deviceSerial = Build.getSerial();
+            } catch (SecurityException e) {
+                deviceSerial = Build.UNKNOWN;
+            }
         }
+        return deviceSerial;
     }
 
     private Intent getBatteryIntent() {
@@ -1243,39 +1278,25 @@ public class MdmService extends Service {
         long now = SystemClock.elapsedRealtime();
         if (wlcLastMs > 0 && now - wlcLastMs < WLC_CACHE_MS) return cachedWlcStatus;
         // On battery there is no charging at all, so the wireless pad is necessarily
-        // disconnected — skip the ~500ms blocking GPIO poll entirely.
+        // disconnected — skip the GPIO read entirely.
         if (!isOnExternalPower()) {
             cachedWlcStatus = 0;
             wlcLastMs = now;
             return cachedWlcStatus;
         }
+        // Single instantaneous read: 1 = guest device on the pad, 0 = none, -1 = unreadable.
+        // We no longer sample over a 500 ms window to detect the toggling "disconnected"
+        // state (formerly status 2): no alert consumes it anymore, and the server's daily
+        // wlc_guest_frac only counts wlc_status == 1 (pad_readable just needs >= 0).
         final String gpioPath = "/sys/devices/platform/soc/soc:customer_gpio/gpio27";
-        final long windowMs = 500;
-        final long stepMs = 10;
-        boolean sawZero = false;
-        boolean sawOne = false;
-        boolean anyRead = false;
-        long deadline = now + windowMs;
-        while (SystemClock.elapsedRealtime() < deadline) {
-            try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(gpioPath))) {
-                String line = reader.readLine();
-                if (line != null) {
-                    String v = line.replace("\0", "").trim();
-                    if (v.equals("0")) { sawZero = true; anyRead = true; }
-                    else if (v.equals("1")) { sawOne = true; anyRead = true; }
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "getWlcStatus error: " + e.getMessage());
-                cachedWlcStatus = -1;
-                wlcLastMs = now;
-                return cachedWlcStatus;
-            }
-            try { Thread.sleep(stepMs); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); break; }
+        try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(gpioPath))) {
+            String line = reader.readLine();
+            String v = line == null ? "" : line.replace("\0", "").trim();
+            cachedWlcStatus = v.equals("1") ? 1 : (v.equals("0") ? 0 : -1);
+        } catch (Exception e) {
+            Log.e(TAG, "getWlcStatus error: " + e.getMessage());
+            cachedWlcStatus = -1;
         }
-        if (!anyRead) cachedWlcStatus = -1;
-        else if (sawZero && sawOne) cachedWlcStatus = 2; // pad disconnected (toggling)
-        else if (sawOne) cachedWlcStatus = 1;            // device placed
-        else cachedWlcStatus = 0;                        // no device
         wlcLastMs = now;
         return cachedWlcStatus;
     }
@@ -1378,6 +1399,7 @@ public class MdmService extends Service {
             try { unregisterReceiver(pollReceiver); } catch (Exception ignored) {}
         }
         executor.shutdownNow();
+        if (heavyExecutor != null) heavyExecutor.shutdownNow();
         if (wsClient != null) wsClient.stop();
         if (networkCallback != null) {
             try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) {}
