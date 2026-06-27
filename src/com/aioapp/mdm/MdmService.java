@@ -1158,8 +1158,17 @@ public class MdmService extends Service {
             List<android.content.pm.ResolveInfo> activities = pm.queryIntentActivities(launcherIntent, 0);
             for (android.content.pm.ResolveInfo ri : activities) {
                 JSONObject app = new JSONObject();
-                app.put("package", ri.activityInfo.packageName);
+                String pkg = ri.activityInfo.packageName;
+                app.put("package", pkg);
                 app.put("name", ri.loadLabel(pm).toString());
+                // Flag system apps so the dashboard only offers uninstall for user apps.
+                boolean isSystem = false;
+                try {
+                    android.content.pm.ApplicationInfo ai = pm.getApplicationInfo(pkg, 0);
+                    isSystem = (ai.flags & android.content.pm.ApplicationInfo.FLAG_SYSTEM) != 0
+                            || (ai.flags & android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0;
+                } catch (Exception ignore) {}
+                app.put("is_system", isSystem);
                 apps.put(app);
             }
         } catch (Exception e) {
