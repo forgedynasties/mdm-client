@@ -723,9 +723,25 @@ public class MdmService extends Service {
 
 
     private void runCaptureLoop(int quality, double scale, int maxFps) {
-        android.view.Display display = getDisplay();
+        // getDisplay() throws/returns null on a Service context on some Android
+        // versions; fall back to the DisplayManager's default display.
+        android.view.Display display = null;
+        try {
+            display = getDisplay();
+        } catch (Throwable t) {
+            Log.w(TAG, "getDisplay() failed on service context: " + t);
+        }
         if (display == null) {
-            Log.e(TAG, "Cannot get display for capture");
+            try {
+                android.hardware.display.DisplayManager dm =
+                        (android.hardware.display.DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+                if (dm != null) display = dm.getDisplay(android.view.Display.DEFAULT_DISPLAY);
+            } catch (Throwable t) {
+                Log.w(TAG, "DisplayManager fallback failed: " + t);
+            }
+        }
+        if (display == null) {
+            Log.e(TAG, "Cannot get display for capture — remote control will show no frames");
             isCapturing = false;
             return;
         }
@@ -739,11 +755,17 @@ public class MdmService extends Service {
         Log.i(TAG, "Capture loop started — scaled=" + scaledW + "x" + scaledH
                 + " quality=" + quality + " fps=" + maxFps);
 
+        long sent = 0, nullFrames = 0, lastLog = System.currentTimeMillis();
         while (isCapturing && wsClient != null && wsClient.isConnected()) {
             long start = System.currentTimeMillis();
             try {
                 android.graphics.Bitmap screen = captureScreen(scaledW, scaledH, rotation);
                 if (screen == null) {
+                    nullFrames++;
+                    if (start - lastLog >= 5000) {
+                        Log.w(TAG, "Capture: 0 frames sent, " + nullFrames + " null captures in last 5s — screen capture is failing");
+                        nullFrames = 0; lastLog = start;
+                    }
                     Thread.sleep(targetMs);
                     continue;
                 }
@@ -753,6 +775,11 @@ public class MdmService extends Service {
 
                 byte[] frame = bos.toByteArray();
                 wsClient.sendBinary(frame);
+                sent++;
+                if (start - lastLog >= 5000) {
+                    Log.i(TAG, "Capture: " + sent + " frames sent in last 5s (" + frame.length + "B last)");
+                    sent = 0; nullFrames = 0; lastLog = start;
+                }
 
                 long elapsed = System.currentTimeMillis() - start;
                 if (elapsed < targetMs) {
