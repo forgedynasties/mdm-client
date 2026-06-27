@@ -1596,8 +1596,13 @@ public class MdmService extends Service {
         packageChangeReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
-                Log.i(TAG, "Package changed, invalidating app cache");
+                Log.i(TAG, "Package changed, invalidating app cache + pushing refreshed list");
                 cachedInstalledApps = null;
+                // Push the refreshed app list right away as a keyframe so the dashboard
+                // reflects an install/uninstall in seconds instead of waiting for the
+                // ~5-minute HTTP safety-net check-in (WS deltas don't carry the app list).
+                forceKeyframe = true;
+                if (networkAvailable && !polling) performCheckin();
             }
         };
         registerReceiver(packageChangeReceiver, filter);
