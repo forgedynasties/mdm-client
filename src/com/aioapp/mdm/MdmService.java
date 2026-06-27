@@ -60,6 +60,9 @@ public class MdmService extends Service {
     private OtaUpdateManager otaUpdateManager;
     private volatile String otaCommandId;  // set while an OTA is in progress
     private volatile boolean isCapturing = false;
+    // Live logcat streams keyed by request_id; the Process is killed to stop a stream.
+    private final java.util.Map<String, java.lang.Process> logcatStreams = new java.util.concurrent.ConcurrentHashMap<>();
+    private static final int MAX_LOGCAT_STREAMS = 3;
     private android.os.PowerManager.WakeLock remoteWakeLock;  // keeps the screen on during a remote session
     private static final long REMOTE_WAKE_TIMEOUT_MS = 30 * 60 * 1000L;  // safety cap so a dropped session can't pin the screen
     private MdmWebSocketClient wsClient;
@@ -353,6 +356,112 @@ public class MdmService extends Service {
         executor.submit(() -> apiService.postLogcat(getDeviceSerial(), requestId, content));
     }
 
+    /**
+     * Runs a continuous `logcat` for a live-tail session and streams batched chunks
+     * over the WebSocket as {type:logcat_stream, request_id, chunk} frames, ending
+     * with a {type:logcat_stream_end} frame. The process is killed when the matching
+     * stop_logcat_stream arrives (it removes the entry from logcatStreams) or the WS
+     * drops. Filters: buffer (main/system/crash/radio/events/all), level (V..E),
+     * tag (exact), grep (logcat -e regex), tail (initial backlog lines).
+     */
+    private void runLogcatStream(String reqId, JSONObject opts) throws Exception {
+        if (reqId == null || reqId.isEmpty()) return;
+        if (logcatStreams.size() >= MAX_LOGCAT_STREAMS) {
+            sendLogcatStreamEnd(reqId, "error", "too many active logcat streams");
+            return;
+        }
+
+        java.util.List<String> args = new java.util.ArrayList<>();
+        args.add("logcat");
+        args.add("-v"); args.add("threadtime");
+        String buffer = opts.optString("buffer", "").trim();
+        if (!buffer.isEmpty() && !buffer.equals("default") && !buffer.equals("main")) {
+            args.add("-b"); args.add(buffer);  // "all" and named buffers; "main" is the default
+        }
+        int tail = opts.optInt("tail", 200);
+        if (tail < 0) tail = 0;
+        if (tail > 5000) tail = 5000;
+        args.add("-T"); args.add(String.valueOf(tail));
+        String grep = opts.optString("grep", "").trim();
+        if (!grep.isEmpty()) { args.add("-e"); args.add(grep); }
+
+        String level = opts.optString("level", "V").trim();
+        if (level.isEmpty()) level = "V";
+        String tag = opts.optString("tag", "").trim();
+        if (!tag.isEmpty()) { args.add(tag + ":" + level); args.add("*:S"); }
+        else { args.add("*:" + level); }
+
+        java.lang.Process p;
+        try {
+            p = new ProcessBuilder(args).redirectErrorStream(true).start();
+        } catch (Exception e) {
+            sendLogcatStreamEnd(reqId, "error", "failed to start logcat: " + e.getMessage());
+            return;
+        }
+        logcatStreams.put(reqId, p);
+        Log.i(TAG, "logcat stream " + reqId + " started: " + args);
+
+        try (java.io.BufferedReader br = new java.io.BufferedReader(
+                new java.io.InputStreamReader(p.getInputStream(), StandardCharsets.UTF_8), 16384)) {
+            char[] buf = new char[8192];
+            StringBuilder sb = new StringBuilder();
+            long lastFlush = System.currentTimeMillis();
+            int n;
+            // Batch output and flush every ~250ms (or when the buffer grows) so a chatty
+            // log doesn't flood the WebSocket with a frame per line.
+            while (logcatStreams.containsKey(reqId)
+                    && wsClient != null && wsClient.isConnected()
+                    && (n = br.read(buf)) != -1) {
+                sb.append(buf, 0, n);
+                long now = System.currentTimeMillis();
+                if (sb.length() >= 12000 || now - lastFlush >= 250) {
+                    sendLogcatChunk(reqId, sb.toString());
+                    sb.setLength(0);
+                    lastFlush = now;
+                }
+            }
+            if (sb.length() > 0) sendLogcatChunk(reqId, sb.toString());
+        } finally {
+            logcatStreams.remove(reqId);
+            try { p.destroyForcibly(); } catch (Exception ignored) {}
+            sendLogcatStreamEnd(reqId, "stopped", "");
+            Log.i(TAG, "logcat stream " + reqId + " ended");
+        }
+    }
+
+    private void sendLogcatChunk(String reqId, String chunk) {
+        if (wsClient == null || !wsClient.isConnected() || chunk == null || chunk.isEmpty()) return;
+        try {
+            JSONObject m = new JSONObject();
+            m.put("type", "logcat_stream");
+            m.put("request_id", reqId);
+            m.put("chunk", chunk);
+            wsClient.send(m.toString());
+        } catch (Exception e) {
+            Log.e(TAG, "logcat chunk send failed: " + e.getMessage());
+        }
+    }
+
+    private void sendLogcatStreamEnd(String reqId, String reason, String error) {
+        if (wsClient == null || !wsClient.isConnected()) return;
+        try {
+            JSONObject m = new JSONObject();
+            m.put("type", "logcat_stream_end");
+            m.put("request_id", reqId);
+            m.put("reason", reason);
+            if (error != null && !error.isEmpty()) m.put("error", error);
+            wsClient.send(m.toString());
+        } catch (Exception ignored) {}
+    }
+
+    /** Kills every active logcat stream — called when the device WS drops or the service stops. */
+    private void stopAllLogcatStreams() {
+        for (java.util.Map.Entry<String, java.lang.Process> e : logcatStreams.entrySet()) {
+            try { e.getValue().destroyForcibly(); } catch (Exception ignored) {}
+        }
+        logcatStreams.clear();
+    }
+
     private void reportOtaStatus(String cmdId, String status, String errorCode) {
         if (wsClient != null && wsClient.isConnected()) {
             try {
@@ -527,6 +636,24 @@ public class MdmService extends Service {
                 isCapturing = false;
                 releaseRemoteWakeLock();
                 break;
+            case "start_logcat_stream": {
+                final JSONObject lcOpts = msg;
+                final String lcReq = msg.optString("request_id", "");
+                heavyExecutor.submit(() -> {
+                    try {
+                        runLogcatStream(lcReq, lcOpts);
+                    } catch (Exception e) {
+                        Log.e(TAG, "logcat stream error: " + e.getMessage());
+                        sendLogcatStreamEnd(lcReq, "error", e.getMessage());
+                    }
+                });
+                break;
+            }
+            case "stop_logcat_stream": {
+                java.lang.Process lp = logcatStreams.remove(msg.optString("request_id", ""));
+                if (lp != null) lp.destroyForcibly();
+                break;
+            }
             case "wake_screen":
                 wakeScreen(null);
                 break;
@@ -1528,6 +1655,7 @@ public class MdmService extends Service {
     @Override
     public void onDestroy() {
         isCapturing = false;
+        stopAllLogcatStreams();
         releaseRemoteWakeLock();
         alarmManager.cancel(pollIntent);
         if (pollReceiver != null) {
