@@ -557,10 +557,24 @@ public class MdmService extends Service {
         });
     }
 
-    private void applyConfig(JSONObject config) throws Exception {
-        KioskManager.applyAndSave(MdmService.this, dpm, adminComponent, config);
+    private void applyConfig(JSONObject config) {
+        // Apply the check-in interval first and independently: a failure applying
+        // kiosk policy (DPM/lock-task can throw) must never stop the device from
+        // adopting the configured poll interval, or it stays on the 30s default.
         long secs = config.optLong("checkin_interval_seconds", 0);
-        if (secs >= 10) apiService.setPollInterval(secs * 1000L);
+        if (secs >= 10) {
+            long ms = secs * 1000L;
+            if (apiService.getPollInterval() != ms) {
+                apiService.setPollInterval(ms);
+                Log.i(TAG, "Applied checkin interval: " + secs + "s");
+                scheduleNextPoll(); // re-arm the alarm immediately at the new cadence
+            }
+        }
+        try {
+            KioskManager.applyAndSave(MdmService.this, dpm, adminComponent, config);
+        } catch (Exception e) {
+            Log.e(TAG, "kiosk applyAndSave error: " + e.getMessage());
+        }
     }
 
     private synchronized void startWebSocket() {
