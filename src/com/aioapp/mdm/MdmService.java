@@ -38,6 +38,7 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 public class MdmService extends Service {
     private static final String TAG = "MdmService";
@@ -686,8 +687,8 @@ public class MdmService extends Service {
         Log.i(TAG, "Processing WS command " + cmdId + " type=" + cmdType);
         switch (cmdType) {
             case "install_apk": {
-                boolean ok = installApk(cmd.getString("apk_url"));
-                ackCommand(cmdId, serialNumber, ok ? "installed" : "failed", "");
+                String err = installApk(cmd.getString("apk_url"));
+                ackCommand(cmdId, serialNumber, err.isEmpty() ? "installed" : "failed", err);
                 break;
             }
             case "uninstall": {
@@ -1155,7 +1156,13 @@ public class MdmService extends Service {
         }
     }
 
-    private boolean installApk(String apkUrl) {
+    /**
+     * Downloads and installs an APK. Returns "" on success, otherwise a short error
+     * reason that is sent back to the server in the command ack so install failures
+     * are diagnosable from the dashboard (previously this returned a bare boolean and
+     * acked with an empty output, so a failed install gave no clue why).
+     */
+    private String installApk(String apkUrl) {
         File apkFile = new File(getCacheDir(), "mdm_install_" + System.currentTimeMillis() + ".apk");
         try {
             // Download
@@ -1163,26 +1170,32 @@ public class MdmService extends Service {
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
             conn.setConnectTimeout(30_000);
             conn.setReadTimeout(60_000);
+            conn.setInstanceFollowRedirects(true);
             conn.connect();
-            if (conn.getResponseCode() != HttpURLConnection.HTTP_OK) {
-                Log.e(TAG, "APK download failed: HTTP " + conn.getResponseCode());
-                return false;
+            int code = conn.getResponseCode();
+            if (code != HttpURLConnection.HTTP_OK) {
+                Log.e(TAG, "APK download failed: HTTP " + code + " for " + apkUrl);
+                return "download failed: HTTP " + code;
             }
+            long written = 0;
             try (InputStream in = conn.getInputStream();
                  FileOutputStream out = new FileOutputStream(apkFile)) {
                 byte[] buf = new byte[8192];
                 int n;
-                while ((n = in.read(buf)) != -1) out.write(buf, 0, n);
+                while ((n = in.read(buf)) != -1) { out.write(buf, 0, n); written += n; }
             }
-            Log.i(TAG, "APK downloaded to " + apkFile.getAbsolutePath());
+            Log.i(TAG, "APK downloaded to " + apkFile.getAbsolutePath() + " (" + written + " bytes)");
+            if (written == 0) return "download failed: empty file";
 
-            // Extract package name from APK for fallback verification
+            // Extract package name from APK for fallback verification + a clearer error.
             String apkPackageName = null;
             android.content.pm.PackageInfo apkInfo = getPackageManager().getPackageArchiveInfo(
                     apkFile.getAbsolutePath(), 0);
             if (apkInfo != null) {
                 apkPackageName = apkInfo.packageName;
                 Log.i(TAG, "APK package: " + apkPackageName);
+            } else {
+                Log.e(TAG, "APK could not be parsed (corrupt or not an APK): " + apkUrl);
             }
 
             // Install via PackageInstaller API
@@ -1195,6 +1208,7 @@ public class MdmService extends Service {
 
             CountDownLatch latch = new CountDownLatch(1);
             AtomicBoolean success = new AtomicBoolean(false);
+            AtomicReference<String> failReason = new AtomicReference<>("");
 
             BroadcastReceiver resultReceiver = new BroadcastReceiver() {
                 @Override
@@ -1206,10 +1220,13 @@ public class MdmService extends Service {
                         success.set(true);
                     } else if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
                         Log.e(TAG, "PackageInstaller requires user action — check USER_ACTION_NOT_REQUIRED / INSTALL_PACKAGES permission");
+                        failReason.set("needs user action — INSTALL_PACKAGES not granted / not a privileged app");
                     } else {
                         String msg = intent.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE);
                         int legacyStatus = intent.getIntExtra("android.content.pm.extra.LEGACY_STATUS", -999);
                         Log.e(TAG, "PackageInstaller failed status=" + status + " legacy=" + legacyStatus + " msg=" + msg);
+                        failReason.set("install failed: status=" + status + " legacy=" + legacyStatus
+                                + (msg != null ? " " + msg : ""));
                     }
                     latch.countDown();
                 }
@@ -1237,24 +1254,29 @@ public class MdmService extends Service {
                 try { unregisterReceiver(resultReceiver); } catch (Exception ignored) {}
             }
 
-            if (success.get()) return true;
+            if (success.get()) return "";
 
-            // Fallback: if timed out or callback reported failure, check if the package is actually installed
+            // Fallback: the package may be present even if the callback reported failure
+            // or never fired (USER_ACTION_NOT_REQUIRED installs sometimes don't broadcast).
             if (apkPackageName != null) {
                 try {
                     getPackageManager().getPackageInfo(apkPackageName, 0);
                     Log.i(TAG, "APK package " + apkPackageName + " is installed (verified via PackageManager"
                             + (completed ? " after callback reported failure)" : " after timeout)"));
-                    return true;
+                    return "";
                 } catch (android.content.pm.PackageManager.NameNotFoundException e) {
                     Log.e(TAG, "APK package " + apkPackageName + " not found after install"
                             + (completed ? " (callback reported failure)" : " (timed out after 180s)"));
                 }
             }
-            return false;
+            String reason = failReason.get();
+            if (!reason.isEmpty()) return reason;
+            if (!completed) return "install timed out after 180s (no result; package not present)";
+            if (apkPackageName == null) return "could not parse APK (corrupt download?)";
+            return "install failed: package not present after commit";
         } catch (Exception e) {
             Log.e(TAG, "installApk error: " + e.getMessage());
-            return false;
+            return "error: " + e.getClass().getSimpleName() + ": " + e.getMessage();
         } finally {
             apkFile.delete();
         }
