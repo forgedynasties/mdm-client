@@ -149,6 +149,24 @@ public class MdmApiService {
         }
     }
 
+    /**
+     * POST /api/v1/commands/{id}/ack — interim install progress.
+     * status = "downloading" | "installing"; percent 0-100 (meaningful while
+     * downloading, pass -1 to omit). Non-terminal: updates the live status only.
+     */
+    public void reportCommandProgress(String commandId, String serialNumber, String status, int percent) {
+        try {
+            JSONObject body = new JSONObject();
+            body.put("serial_number", serialNumber);
+            body.put("status", status);
+            if (percent >= 0) body.put("progress", percent);
+            PostResult result = doPost("/api/v1/commands/" + commandId + "/ack", body.toString());
+            Log.d(TAG, "Progress command " + commandId + " status=" + status + " pct=" + percent + " response=" + result.code);
+        } catch (Exception e) {
+            Log.e(TAG, "reportCommandProgress failed: " + e.getMessage());
+        }
+    }
+
     private static class PostResult {
         final int code;
         final String body;

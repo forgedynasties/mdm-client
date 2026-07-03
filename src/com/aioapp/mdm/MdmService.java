@@ -480,6 +480,27 @@ public class MdmService extends Service {
         executor.submit(() -> apiService.postOtaStatus(getDeviceSerial(), cmdId, status, errorCode));
     }
 
+    /** Relay interim install progress ('downloading' with a percent, or 'installing')
+     *  to the server so the dashboard shows it live. WS-first, HTTP fallback; percent
+     *  < 0 omits the number. Non-terminal — the terminal ack still follows. */
+    private void reportInstallProgress(String cmdId, String serial, String status, int percent) {
+        if (cmdId == null || cmdId.isEmpty()) return;
+        if (wsClient != null && wsClient.isConnected()) {
+            try {
+                JSONObject m = new JSONObject();
+                m.put("type", "command_ack");
+                m.put("command_id", cmdId);
+                m.put("status", status);
+                if (percent >= 0) m.put("progress", percent);
+                wsClient.send(m.toString());
+                return;
+            } catch (Exception e) {
+                Log.e(TAG, "WS install progress failed, falling back to HTTP: " + e.getMessage());
+            }
+        }
+        executor.submit(() -> apiService.reportCommandProgress(cmdId, serial, status, percent));
+    }
+
     /** Sends a real-time OTA progress frame over the WebSocket (best-effort). */
     private void sendOtaProgressFrame(String cmdId, String phase, int percent) {
         if (cmdId == null || wsClient == null) return;
@@ -687,7 +708,7 @@ public class MdmService extends Service {
         Log.i(TAG, "Processing WS command " + cmdId + " type=" + cmdType);
         switch (cmdType) {
             case "install_apk": {
-                String err = installApk(cmd.getString("apk_url"));
+                String err = installApk(cmd.getString("apk_url"), cmdId, serialNumber);
                 ackCommand(cmdId, serialNumber, err.isEmpty() ? "installed" : "failed", err);
                 break;
             }
@@ -1162,7 +1183,7 @@ public class MdmService extends Service {
      * are diagnosable from the dashboard (previously this returned a bare boolean and
      * acked with an empty output, so a failed install gave no clue why).
      */
-    private String installApk(String apkUrl) {
+    private String installApk(String apkUrl, String cmdId, String serial) {
         File apkFile = new File(getCacheDir(), "mdm_install_" + System.currentTimeMillis() + ".apk");
         try {
             // Download
@@ -1177,15 +1198,28 @@ public class MdmService extends Service {
                 Log.e(TAG, "APK download failed: HTTP " + code + " for " + apkUrl);
                 return "download failed: HTTP " + code;
             }
+            long total = conn.getContentLengthLong(); // -1 if the server didn't send it
+            reportInstallProgress(cmdId, serial, "downloading", total > 0 ? 0 : -1);
             long written = 0;
+            int lastPct = -1;
             try (InputStream in = conn.getInputStream();
                  FileOutputStream out = new FileOutputStream(apkFile)) {
                 byte[] buf = new byte[8192];
                 int n;
-                while ((n = in.read(buf)) != -1) { out.write(buf, 0, n); written += n; }
+                while ((n = in.read(buf)) != -1) {
+                    out.write(buf, 0, n); written += n;
+                    // Relay percent while we know the size, throttled to whole-5% steps
+                    // so we don't spam the server on a fast link.
+                    if (total > 0) {
+                        int pct = (int) (written * 100 / total);
+                        if (pct >= lastPct + 5 && pct < 100) { lastPct = pct; reportInstallProgress(cmdId, serial, "downloading", pct); }
+                    }
+                }
             }
             Log.i(TAG, "APK downloaded to " + apkFile.getAbsolutePath() + " (" + written + " bytes)");
             if (written == 0) return "download failed: empty file";
+            // Download done → now installing.
+            reportInstallProgress(cmdId, serial, "installing", -1);
 
             // Extract package name from APK for fallback verification + a clearer error.
             String apkPackageName = null;
