@@ -137,11 +137,18 @@ public class MdmApiService {
      * output may be empty, stdout text, or base64-encoded binary.
      */
     public void ackCommand(String commandId, String serialNumber, String status, String output) {
+        ackCommand(commandId, serialNumber, status, output, null);
+    }
+
+    /** pkg (nullable) = the package an install produced; sent on 'installed' so the
+     *  server learns the APK→package mapping and can reconcile stuck installs. */
+    public void ackCommand(String commandId, String serialNumber, String status, String output, String pkg) {
         try {
             JSONObject body = new JSONObject();
             body.put("serial_number", serialNumber);
             body.put("status", status);
             if (!output.isEmpty()) body.put("output", output);
+            if (pkg != null && !pkg.isEmpty()) body.put("package", pkg);
             PostResult result = doPost("/api/v1/commands/" + commandId + "/ack", body.toString());
             Log.d(TAG, "Ack command " + commandId + " status=" + status + " response=" + result.code);
         } catch (Exception e) {

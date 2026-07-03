@@ -324,6 +324,12 @@ public class MdmService extends Service {
     }
 
     private void ackCommand(String cmdId, String serial, String status, String output) {
+        ackCommand(cmdId, serial, status, output, null);
+    }
+
+    /** pkg (nullable) is the package an install produced — reported on 'installed' so
+     *  the server can reconcile a stuck install against the device's package list. */
+    private void ackCommand(String cmdId, String serial, String status, String output, String pkg) {
         if (wsClient != null && wsClient.isConnected()) {
             try {
                 JSONObject m = new JSONObject();
@@ -332,13 +338,14 @@ public class MdmService extends Service {
                 m.put("serial_number", serial);
                 m.put("status", status);
                 if (!output.isEmpty()) m.put("output", output);
+                if (pkg != null && !pkg.isEmpty()) m.put("package", pkg);
                 wsClient.send(m.toString());
                 return;
             } catch (Exception e) {
                 Log.e(TAG, "WS ack failed, falling back to HTTP: " + e.getMessage());
             }
         }
-        executor.submit(() -> apiService.ackCommand(cmdId, serial, status, output));
+        executor.submit(() -> apiService.ackCommand(cmdId, serial, status, output, pkg));
     }
 
     private void reportLogcat(String requestId, String content) {
@@ -708,8 +715,9 @@ public class MdmService extends Service {
         Log.i(TAG, "Processing WS command " + cmdId + " type=" + cmdType);
         switch (cmdType) {
             case "install_apk": {
-                String err = installApk(cmd.getString("apk_url"), cmdId, serialNumber);
-                ackCommand(cmdId, serialNumber, err.isEmpty() ? "installed" : "failed", err);
+                String[] pkgHolder = new String[1];
+                String err = installApk(cmd.getString("apk_url"), cmdId, serialNumber, pkgHolder);
+                ackCommand(cmdId, serialNumber, err.isEmpty() ? "installed" : "failed", err, pkgHolder[0]);
                 break;
             }
             case "uninstall": {
@@ -1183,7 +1191,7 @@ public class MdmService extends Service {
      * are diagnosable from the dashboard (previously this returned a bare boolean and
      * acked with an empty output, so a failed install gave no clue why).
      */
-    private String installApk(String apkUrl, String cmdId, String serial) {
+    private String installApk(String apkUrl, String cmdId, String serial, String[] outPkg) {
         File apkFile = new File(getCacheDir(), "mdm_install_" + System.currentTimeMillis() + ".apk");
         try {
             // Download
@@ -1227,6 +1235,7 @@ public class MdmService extends Service {
                     apkFile.getAbsolutePath(), 0);
             if (apkInfo != null) {
                 apkPackageName = apkInfo.packageName;
+                if (outPkg != null) outPkg[0] = apkPackageName; // report to server on ack
                 Log.i(TAG, "APK package: " + apkPackageName);
             } else {
                 Log.e(TAG, "APK could not be parsed (corrupt or not an APK): " + apkUrl);
