@@ -87,6 +87,12 @@ public class MdmService extends Service {
     // transitions (ACTION_BATTERY_CHANGED fires on every level change too).
     private volatile int lastChargingState = -1; // -1 unknown, 0 not charging, 1 charging
 
+    // Wi-Fi disconnect tracking: edge-detect connected→disconnected and keep the last
+    // hour of event timestamps (elapsedRealtime millis) so getWifiDisconnects1h() is O(n).
+    private BroadcastReceiver wifiReceiver;
+    private volatile boolean wifiWasConnected = false;
+    private final java.util.ArrayDeque<Long> wifiDisconnects = new java.util.ArrayDeque<>();
+
     // Per-field system query caches
     private double cachedStorageFreeGb = 0;
     private long storageLastMs = 0;
@@ -172,6 +178,21 @@ public class MdmService extends Service {
         };
         cachedBatteryIntent = registerReceiver(batteryReceiver,
                 new IntentFilter(Intent.ACTION_BATTERY_CHANGED));
+
+        // Wi-Fi stability: count connected→disconnected transitions so the server can flag
+        // "≥N disconnects in an hour". SUPPLICANT/NETWORK state changes fire often, so we
+        // only record an edge from a previously-connected state to a disconnected one.
+        wifiReceiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context context, Intent intent) {
+                NetworkInfo ni = intent.getParcelableExtra(WifiManager.EXTRA_NETWORK_INFO);
+                boolean connected = ni != null && ni.isConnected();
+                if (wifiWasConnected && !connected) {
+                    recordWifiDisconnect();
+                }
+                wifiWasConnected = connected;
+            }
+        };
+        registerReceiver(wifiReceiver, new IntentFilter(WifiManager.NETWORK_STATE_CHANGED_ACTION));
 
         alarmManager = getSystemService(AlarmManager.class);
         pollReceiver = new BroadcastReceiver() {
@@ -1422,9 +1443,17 @@ public class MdmService extends Service {
         extra.put("timezone", java.util.TimeZone.getDefault().getID());
         extra.put("battery_temp_c", extractBatteryTemperature(batteryIntent));
         extra.put("charging", extractCharging(batteryIntent));
-        // System health: reboot reason.
+        // Charger detail for the 5V-charger / slow-charge rules: voltage (mV) + plug type.
+        extra.put("charger_voltage_mv", extractChargerVoltage(batteryIntent));
+        extra.put("charger_type", extractChargerType(batteryIntent));
+        // Wi-Fi stability: disconnects observed in the last hour (WifiStateTracker).
+        extra.put("wifi_disconnects_1h", getWifiDisconnects1h());
+        // System health: reboot reason + per-boot id (changes every reboot → the server
+        // detects unexpected reboots) + recent DropBox crashes/ANRs (server dedupes).
         extra.put("boot_reason", SystemPropertiesProxy.get("sys.boot.reason",
                 SystemPropertiesProxy.get("ro.boot.bootreason", "")));
+        extra.put("boot_id", getBootId());
+        extra.put("crash_events", getRecentCrashEvents());
         // Include OTA progress if an update is in progress
         if (otaUpdateManager != null && otaUpdateManager.isActive() && otaCommandId != null) {
             JSONObject otaProgress = new JSONObject();
@@ -1467,10 +1496,13 @@ public class MdmService extends Service {
     // value via merge). Volatile keys are always included in any frame we do send.
     private static final String[] GATED_EXTRA_KEYS = {
             "charging", "storage_free_gb", "wlc_status", "wifi", "ip_address",
-            "timezone", "boot_reason"
+            "timezone", "boot_reason", "charger_type", "boot_id"
     };
     private static final String[] VOLATILE_EXTRA_KEYS = {
-            "battery_temp_c", "ram_usage_mb", "uptime_seconds", "wifi_rssi", "ota_progress"
+            "battery_temp_c", "ram_usage_mb", "uptime_seconds", "wifi_rssi", "ota_progress",
+            // Always carried in any frame we send: charger voltage moves continuously, and
+            // crash/disconnect signals must never be dropped waiting for a gated change.
+            "charger_voltage_mv", "wifi_disconnects_1h", "crash_events"
     };
 
     /** Delta payload: the volatile set + any changed gated fields; battery_pct only if changed. */
@@ -1565,6 +1597,111 @@ public class MdmService extends Service {
         int status = batteryStatus.getIntExtra(BatteryManager.EXTRA_STATUS, BatteryManager.BATTERY_STATUS_UNKNOWN);
         return status == BatteryManager.BATTERY_STATUS_CHARGING
                 || status == BatteryManager.BATTERY_STATUS_FULL;
+    }
+
+    /** Charger voltage in millivolts (BatteryManager.EXTRA_VOLTAGE); -1 if unknown. A plain
+     *  5V (~5000 mV) supply distinguishes a basic charger from a higher-voltage fast charger. */
+    private int extractChargerVoltage(Intent batteryStatus) {
+        if (batteryStatus == null) return -1;
+        return batteryStatus.getIntExtra(BatteryManager.EXTRA_VOLTAGE, -1);
+    }
+
+    /** Plug type: none | ac | usb | wireless | unknown (from BatteryManager.EXTRA_PLUGGED). */
+    private String extractChargerType(Intent batteryStatus) {
+        if (batteryStatus == null) return "unknown";
+        int plugged = batteryStatus.getIntExtra(BatteryManager.EXTRA_PLUGGED, 0);
+        if (plugged == 0) return "none";
+        if ((plugged & BatteryManager.BATTERY_PLUGGED_AC) != 0) return "ac";
+        if ((plugged & BatteryManager.BATTERY_PLUGGED_USB) != 0) return "usb";
+        if ((plugged & BatteryManager.BATTERY_PLUGGED_WIRELESS) != 0) return "wireless";
+        return "unknown";
+    }
+
+    /** Record a Wi-Fi disconnect and prune events older than an hour. */
+    private void recordWifiDisconnect() {
+        long now = SystemClock.elapsedRealtime();
+        synchronized (wifiDisconnects) {
+            wifiDisconnects.addLast(now);
+            while (!wifiDisconnects.isEmpty() && now - wifiDisconnects.peekFirst() > CRASH_LOOKBACK_MS) {
+                wifiDisconnects.removeFirst();
+            }
+        }
+        Log.i(TAG, "Wi-Fi disconnect recorded (" + wifiDisconnects.size() + " in last hour)");
+    }
+
+    /** Count of Wi-Fi disconnects in the last hour (prunes old events first). */
+    private int getWifiDisconnects1h() {
+        long now = SystemClock.elapsedRealtime();
+        synchronized (wifiDisconnects) {
+            while (!wifiDisconnects.isEmpty() && now - wifiDisconnects.peekFirst() > CRASH_LOOKBACK_MS) {
+                wifiDisconnects.removeFirst();
+            }
+            return wifiDisconnects.size();
+        }
+    }
+
+    /** Per-boot UUID from /proc (changes on every reboot). Cached — it is constant per boot.
+     *  The server compares it across check-ins to detect an (unexpected) reboot. */
+    private String cachedBootId;
+    private String getBootId() {
+        if (cachedBootId != null) return cachedBootId;
+        java.io.BufferedReader r = null;
+        try {
+            r = new java.io.BufferedReader(new java.io.FileReader("/proc/sys/kernel/random/boot_id"));
+            String line = r.readLine();
+            cachedBootId = (line != null) ? line.trim() : "";
+        } catch (Exception e) {
+            cachedBootId = "";
+        } finally {
+            if (r != null) try { r.close(); } catch (Exception ignore) {}
+        }
+        return cachedBootId;
+    }
+
+    // DropBox tags that represent an app/system crash, ANR, or native tombstone.
+    private static final String[] CRASH_TAGS = {
+            "data_app_crash", "data_app_anr", "data_app_native_crash",
+            "system_app_crash", "system_app_anr", "system_app_native_crash",
+            "system_server_crash", "system_server_anr", "system_server_native_crash",
+            "SYSTEM_TOMBSTONE"
+    };
+    private static final long CRASH_LOOKBACK_MS = 60 * 60 * 1000L; // last hour
+
+    /** Recent crash/ANR/tombstone entries from DropBoxManager (readable to this system-UID
+     *  app), as [{kind,time_ms,summary}]. Reports the last hour on every check-in; the server
+     *  dedupes by (device,kind,time_ms), so a repeated report of the same crash is harmless
+     *  and a lost send is recovered on the next check-in. */
+    private JSONArray getRecentCrashEvents() {
+        JSONArray arr = new JSONArray();
+        try {
+            android.os.DropBoxManager dbm =
+                    (android.os.DropBoxManager) getSystemService(Context.DROPBOX_SERVICE);
+            if (dbm == null) return arr;
+            long since = System.currentTimeMillis() - CRASH_LOOKBACK_MS;
+            for (String tag : CRASH_TAGS) {
+                long cursor = since;
+                for (int i = 0; i < 50; i++) { // bound work per tag
+                    android.os.DropBoxManager.Entry e = dbm.getNextEntry(tag, cursor);
+                    if (e == null) break;
+                    try {
+                        long t = e.getTimeMillis();
+                        JSONObject o = new JSONObject();
+                        o.put("kind", tag);
+                        o.put("time_ms", t);
+                        String txt = e.getText(200);
+                        if (txt != null) o.put("summary", txt.split("\\n", 2)[0]);
+                        arr.put(o);
+                        if (t <= cursor) t = cursor + 1; // guard against equal timestamps
+                        cursor = t;
+                    } finally {
+                        e.close();
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            Log.w(TAG, "crash events read failed: " + t.getMessage());
+        }
+        return arr;
     }
 
     private void populateWifiInfo(JSONObject extra) throws JSONException {
@@ -1756,6 +1893,9 @@ public class MdmService extends Service {
         }
         if (batteryReceiver != null) {
             try { unregisterReceiver(batteryReceiver); } catch (Exception ignored) {}
+        }
+        if (wifiReceiver != null) {
+            try { unregisterReceiver(wifiReceiver); } catch (Exception ignored) {}
         }
         super.onDestroy();
     }
