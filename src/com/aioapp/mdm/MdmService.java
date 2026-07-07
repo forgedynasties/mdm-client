@@ -1693,8 +1693,8 @@ public class MdmService extends Service {
                         // Read the full entry (up to the remaining budget). getText's arg is a
                         // byte cap, so the old getText(200) truncated to the first line only.
                         int cap = Math.min(MAX_TRACE_BYTES, Math.max(0, traceBudget));
-                        String txt = e.getText(cap > 0 ? cap : 200);
-                        if (txt != null) {
+                        String txt = readEntry(e, cap > 0 ? cap : 200);
+                        if (txt != null && !txt.isEmpty()) {
                             o.put("summary", txt.split("\\n", 2)[0]);
                             if (cap > 0) {
                                 o.put("trace", txt);
@@ -1713,6 +1713,28 @@ public class MdmService extends Service {
             Log.w(TAG, "crash events read failed: " + t.getMessage());
         }
         return arr;
+    }
+
+    /** Read up to {@code cap} bytes of a DropBox entry's text. Prefers getText(), but falls
+     *  back to the raw (gzip-decoded) input stream when getText() returns null — which it does
+     *  for any entry not flagged IS_TEXT (notably native tombstones). Without this fallback the
+     *  crash event is reported with only its kind/time and no trace at all. */
+    private static String readEntry(android.os.DropBoxManager.Entry e, int cap) {
+        String txt = e.getText(cap);
+        if (txt != null) return txt;
+        java.io.InputStream is = null;
+        try {
+            is = e.getInputStream(); // already gunzipped by the framework when IS_GZIPPED
+            if (is == null) return null;
+            byte[] buf = new byte[cap];
+            int off = 0, n;
+            while (off < cap && (n = is.read(buf, off, cap - off)) > 0) off += n;
+            return new String(buf, 0, off, java.nio.charset.StandardCharsets.UTF_8);
+        } catch (Throwable t) {
+            return null;
+        } finally {
+            if (is != null) try { is.close(); } catch (java.io.IOException ignore) {}
+        }
     }
 
     private void populateWifiInfo(JSONObject extra) throws JSONException {
