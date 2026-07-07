@@ -1695,7 +1695,7 @@ public class MdmService extends Service {
                         int cap = Math.min(MAX_TRACE_BYTES, Math.max(0, traceBudget));
                         String txt = readEntry(e, cap > 0 ? cap : 200);
                         if (txt != null && !txt.isEmpty()) {
-                            o.put("summary", txt.split("\\n", 2)[0]);
+                            o.put("summary", crashHeadline(txt));
                             if (cap > 0) {
                                 o.put("trace", txt);
                                 traceBudget -= txt.length();
@@ -1713,6 +1713,29 @@ public class MdmService extends Service {
             Log.w(TAG, "crash events read failed: " + t.getMessage());
         }
         return arr;
+    }
+
+    /** A useful one-line headline from a DropBox crash/ANR/tombstone body. The entry opens with
+     *  "Key: value" header lines (SystemUptimeMs, Process, PID, …), then a blank line, then the
+     *  real exception/abort message. The bare first line is "SystemUptimeMs: …", which is
+     *  useless as an alert headline — so prefer "&lt;process&gt; — &lt;first body line&gt;",
+     *  falling back to the first non-blank line (e.g. native tombstones with no header). */
+    private static String crashHeadline(String txt) {
+        String[] lines = txt.split("\\n");
+        String proc = null;
+        int body = 0; // index of the first line after the header's blank separator
+        for (int i = 0; i < lines.length; i++) {
+            if (proc == null && lines[i].startsWith("Process:")) proc = lines[i].substring(8).trim();
+            if (lines[i].trim().isEmpty()) { body = i + 1; break; }
+        }
+        String exc = "";
+        for (int i = body; i < lines.length; i++) {
+            if (!lines[i].trim().isEmpty()) { exc = lines[i].trim(); break; }
+        }
+        if (exc.isEmpty()) exc = lines.length > 0 ? lines[0].trim() : "";
+        if (proc != null && !proc.isEmpty() && !exc.isEmpty()) return proc + " — " + exc;
+        if (!exc.isEmpty()) return exc;
+        return proc != null ? proc : "";
     }
 
     /** Read up to {@code cap} bytes of a DropBox entry's text. Prefers getText(), but falls
