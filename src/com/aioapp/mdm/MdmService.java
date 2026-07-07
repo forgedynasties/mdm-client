@@ -737,7 +737,12 @@ public class MdmService extends Service {
         switch (cmdType) {
             case "install_apk": {
                 String[] pkgHolder = new String[1];
-                String err = installApk(cmd.getString("apk_url"), cmdId, serialNumber, pkgHolder);
+                // apk_size / apk_etag are populated server-side (best-effort HEAD of the
+                // APK URL) so the download can verify completeness and resume safely.
+                long apkSize = payload.optLong("apk_size", -1);
+                String apkEtag = payload.optString("apk_etag", null);
+                String err = installApk(cmd.getString("apk_url"), cmdId, serialNumber, pkgHolder,
+                        apkSize, apkEtag);
                 ackCommand(cmdId, serialNumber, err.isEmpty() ? "installed" : "failed", err, pkgHolder[0]);
                 break;
             }
@@ -1212,39 +1217,31 @@ public class MdmService extends Service {
      * are diagnosable from the dashboard (previously this returned a bare boolean and
      * acked with an empty output, so a failed install gave no clue why).
      */
-    private String installApk(String apkUrl, String cmdId, String serial, String[] outPkg) {
+    private String installApk(String apkUrl, String cmdId, String serial, String[] outPkg,
+                              long expectedSize, String etag) {
         File apkFile = new File(getCacheDir(), "mdm_install_" + System.currentTimeMillis() + ".apk");
         try {
-            // Download
-            URL url = new URL(apkUrl);
-            HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-            conn.setConnectTimeout(30_000);
-            conn.setReadTimeout(60_000);
-            conn.setInstanceFollowRedirects(true);
-            conn.connect();
-            int code = conn.getResponseCode();
-            if (code != HttpURLConnection.HTTP_OK) {
-                Log.e(TAG, "APK download failed: HTTP " + code + " for " + apkUrl);
-                return "download failed: HTTP " + code;
-            }
-            long total = conn.getContentLengthLong(); // -1 if the server didn't send it
-            reportInstallProgress(cmdId, serial, "downloading", total > 0 ? 0 : -1);
-            long written = 0;
-            int lastPct = -1;
-            try (InputStream in = conn.getInputStream();
-                 FileOutputStream out = new FileOutputStream(apkFile)) {
-                byte[] buf = new byte[8192];
-                int n;
-                while ((n = in.read(buf)) != -1) {
-                    out.write(buf, 0, n); written += n;
-                    // Relay percent while we know the size, throttled to whole-5% steps
-                    // so we don't spam the server on a fast link.
-                    if (total > 0) {
-                        int pct = (int) (written * 100 / total);
-                        if (pct >= lastPct + 5 && pct < 100) { lastPct = pct; reportInstallProgress(cmdId, serial, "downloading", pct); }
-                    }
-                }
-            }
+            // Download with Range resume + retry. A stale keep-alive socket ("unexpected
+            // end of stream") or a transient stall on a large APK ("SocketTimeoutException")
+            // no longer fails the whole install — the next attempt resumes from disk and the
+            // final size is verified before we hand the file to PackageInstaller.
+            reportInstallProgress(cmdId, serial, "downloading", expectedSize > 0 ? 0 : -1);
+            final int[] lastPct = { -1 };
+            HttpDownloader.downloadWithResume(apkUrl, apkFile, expectedSize, etag,
+                    30_000, 60_000, 5,
+                    (downloaded, total) -> {
+                        // Relay percent while we know the size, throttled to whole-5% steps
+                        // so we don't spam the server on a fast link.
+                        if (total > 0) {
+                            int pct = (int) (downloaded * 100 / total);
+                            if (pct >= lastPct[0] + 5 && pct < 100) {
+                                lastPct[0] = pct;
+                                reportInstallProgress(cmdId, serial, "downloading", pct);
+                            }
+                        }
+                    },
+                    null);
+            long written = apkFile.length();
             Log.i(TAG, "APK downloaded to " + apkFile.getAbsolutePath() + " (" + written + " bytes)");
             if (written == 0) return "download failed: empty file";
             // Download done → now installing.

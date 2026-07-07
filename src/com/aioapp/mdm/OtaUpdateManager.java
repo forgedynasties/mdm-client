@@ -9,8 +9,6 @@ import android.os.UpdateEngineCallback;
 import android.util.Log;
 
 import java.io.*;
-import java.net.HttpURLConnection;
-import java.net.URL;
 import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
@@ -204,46 +202,26 @@ public class OtaUpdateManager {
     // ----------------------------------------------------------------
 
     private void downloadFile(String fileUrl, File targetFile, int myGen) throws Exception {
-        long existingSize = targetFile.exists() ? targetFile.length() : 0;
-        URL url = new URL(fileUrl);
-        HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-        // Without a read timeout a dead connection blocks this thread until the
-        // wake lock expires; with Range resume a retry is cheap.
-        conn.setConnectTimeout(DOWNLOAD_CONNECT_TIMEOUT_MS);
-        conn.setReadTimeout(DOWNLOAD_READ_TIMEOUT_MS);
-
-        if (existingSize > 0) {
-            conn.setRequestProperty("Range", "bytes=" + existingSize + "-");
-        }
-
-        int responseCode = conn.getResponseCode();
-        boolean resuming = (responseCode == HttpURLConnection.HTTP_PARTIAL);
-        long contentLength = conn.getContentLengthLong();
-        long totalSize = contentLength + (resuming ? existingSize : 0);
-
-        try (InputStream in = conn.getInputStream();
-             OutputStream out = new FileOutputStream(targetFile, resuming)) {
-            byte[] buffer = new byte[8192];
-            int read;
-            long downloaded = resuming ? existingSize : 0;
-
-            while ((read = in.read(buffer)) != -1) {
-                if (myGen != generation) return; // cancelled
-                out.write(buffer, 0, read);
-                downloaded += read;
-
-                if (totalSize > 0) {
-                    int pct = (int) (downloaded * 100 / totalSize);
-                    currentPercent = pct;
-                    int step = pct / PROGRESS_REPORT_STEP;
-                    int lastStep = lastReportedPercent < 0 ? -1 : lastReportedPercent / PROGRESS_REPORT_STEP;
-                    if (step != lastStep || pct == 100) {
-                        lastReportedPercent = pct;
-                        if (listener != null) listener.onDownloadProgress("downloading", pct);
+        // Range resume + retry (5 attempts, exponential backoff). A dropped or stale
+        // connection mid-download no longer restarts the whole (potentially multi-GB)
+        // image — the next attempt continues from disk — and the final size is verified
+        // before hand-off to UpdateEngine. expectedSize is unknown here, so the helper
+        // falls back to the response Content-Length.
+        HttpDownloader.downloadWithResume(fileUrl, targetFile, -1, null,
+                DOWNLOAD_CONNECT_TIMEOUT_MS, DOWNLOAD_READ_TIMEOUT_MS, 5,
+                (downloaded, totalSize) -> {
+                    if (totalSize > 0) {
+                        int pct = (int) (downloaded * 100 / totalSize);
+                        currentPercent = pct;
+                        int step = pct / PROGRESS_REPORT_STEP;
+                        int lastStep = lastReportedPercent < 0 ? -1 : lastReportedPercent / PROGRESS_REPORT_STEP;
+                        if (step != lastStep || pct == 100) {
+                            lastReportedPercent = pct;
+                            if (listener != null) listener.onDownloadProgress("downloading", pct);
+                        }
                     }
-                }
-            }
-        }
+                },
+                () -> myGen != generation);
     }
 
     // ----------------------------------------------------------------
