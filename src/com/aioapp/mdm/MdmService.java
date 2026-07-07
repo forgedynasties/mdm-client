@@ -1663,11 +1663,15 @@ public class MdmService extends Service {
             "SYSTEM_TOMBSTONE"
     };
     private static final long CRASH_LOOKBACK_MS = 60 * 60 * 1000L; // last hour
+    private static final int  MAX_TRACE_BYTES = 64 * 1024;   // full trace body per crash
+    private static final int  MAX_TOTAL_TRACE_BYTES = 256 * 1024; // budget across one check-in
 
     /** Recent crash/ANR/tombstone entries from DropBoxManager (readable to this system-UID
-     *  app), as [{kind,time_ms,summary}]. Reports the last hour on every check-in; the server
-     *  dedupes by (device,kind,time_ms), so a repeated report of the same crash is harmless
-     *  and a lost send is recovered on the next check-in. */
+     *  app), as [{kind,time_ms,summary,trace}]. The DropBox entry holds the real diagnostic —
+     *  the Java stack trace, the ANR (blocked-thread) trace, or the native tombstone — so we
+     *  send it as `trace` (capped per-entry and across the check-in), keeping `summary` as the
+     *  headline first line. Reports the last hour on every check-in; the server dedupes by
+     *  (device,kind,time_ms), so a repeated report is harmless and a lost send self-recovers. */
     private JSONArray getRecentCrashEvents() {
         JSONArray arr = new JSONArray();
         try {
@@ -1675,6 +1679,7 @@ public class MdmService extends Service {
                     (android.os.DropBoxManager) getSystemService(Context.DROPBOX_SERVICE);
             if (dbm == null) return arr;
             long since = System.currentTimeMillis() - CRASH_LOOKBACK_MS;
+            int traceBudget = MAX_TOTAL_TRACE_BYTES;
             for (String tag : CRASH_TAGS) {
                 long cursor = since;
                 for (int i = 0; i < 50; i++) { // bound work per tag
@@ -1685,8 +1690,17 @@ public class MdmService extends Service {
                         JSONObject o = new JSONObject();
                         o.put("kind", tag);
                         o.put("time_ms", t);
-                        String txt = e.getText(200);
-                        if (txt != null) o.put("summary", txt.split("\\n", 2)[0]);
+                        // Read the full entry (up to the remaining budget). getText's arg is a
+                        // byte cap, so the old getText(200) truncated to the first line only.
+                        int cap = Math.min(MAX_TRACE_BYTES, Math.max(0, traceBudget));
+                        String txt = e.getText(cap > 0 ? cap : 200);
+                        if (txt != null) {
+                            o.put("summary", txt.split("\\n", 2)[0]);
+                            if (cap > 0) {
+                                o.put("trace", txt);
+                                traceBudget -= txt.length();
+                            }
+                        }
                         arr.put(o);
                         if (t <= cursor) t = cursor + 1; // guard against equal timestamps
                         cursor = t;
