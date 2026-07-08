@@ -44,6 +44,9 @@ public class MdmService extends Service {
     private static final String TAG = "MdmService";
     private static final String CHANNEL_ID = "MDM_SERVICE";
     private static final int NOTIFICATION_ID = 1001;
+    // Separate notification for app download/install progress, so it doesn't disturb the
+    // persistent foreground-service notification (1001).
+    private static final int INSTALL_NOTIFICATION_ID = 1002;
 
     private static final String POLL_ACTION = "com.aioapp.mdm.POLL";
 
@@ -1219,6 +1222,19 @@ public class MdmService extends Service {
      */
     private String installApk(String apkUrl, String cmdId, String serial, String[] outPkg,
                               long expectedSize, String etag) {
+        // title[0] starts generic and is upgraded to the app's display label once the APK
+        // is parsed, so the on-device notification (and its final result) names the app.
+        String[] title = { "App install" };
+        String err = installApkInner(apkUrl, cmdId, serial, outPkg, expectedSize, etag, title);
+        // Final result notification (dismissible; not ongoing) — reuses the same id so it
+        // replaces the progress notification in place.
+        showInstallNotification(title[0], err.isEmpty() ? "Installed" : "Install failed: " + err,
+                err.isEmpty() ? 100 : 0, false);
+        return err;
+    }
+
+    private String installApkInner(String apkUrl, String cmdId, String serial, String[] outPkg,
+                                   long expectedSize, String etag, String[] title) {
         File apkFile = new File(getCacheDir(), "mdm_install_" + System.currentTimeMillis() + ".apk");
         try {
             // Download with Range resume + retry. A stale keep-alive socket ("unexpected
@@ -1226,6 +1242,7 @@ public class MdmService extends Service {
             // no longer fails the whole install — the next attempt resumes from disk and the
             // final size is verified before we hand the file to PackageInstaller.
             reportInstallProgress(cmdId, serial, "downloading", expectedSize > 0 ? 0 : -1);
+            showInstallNotification(title[0], "Downloading…", expectedSize > 0 ? 0 : -1, true);
             final int[] lastPct = { -1 };
             HttpDownloader.downloadWithResume(apkUrl, apkFile, expectedSize, etag,
                     30_000, 60_000, 5,
@@ -1237,6 +1254,7 @@ public class MdmService extends Service {
                             if (pct >= lastPct[0] + 5 && pct < 100) {
                                 lastPct[0] = pct;
                                 reportInstallProgress(cmdId, serial, "downloading", pct);
+                                showInstallNotification(title[0], "Downloading " + pct + "%", pct, true);
                             }
                         }
                     },
@@ -1247,17 +1265,26 @@ public class MdmService extends Service {
             // Download done → now installing.
             reportInstallProgress(cmdId, serial, "installing", -1);
 
-            // Extract package name from APK for fallback verification + a clearer error.
+            // Extract package name (+ display label) from the APK for fallback verification,
+            // a clearer error, and the user-facing notification title.
             String apkPackageName = null;
             android.content.pm.PackageInfo apkInfo = getPackageManager().getPackageArchiveInfo(
                     apkFile.getAbsolutePath(), 0);
             if (apkInfo != null) {
                 apkPackageName = apkInfo.packageName;
                 if (outPkg != null) outPkg[0] = apkPackageName; // report to server on ack
+                // Load the human-readable app label (needs sourceDir set for an uninstalled APK).
+                if (apkInfo.applicationInfo != null) {
+                    apkInfo.applicationInfo.sourceDir = apkFile.getAbsolutePath();
+                    apkInfo.applicationInfo.publicSourceDir = apkFile.getAbsolutePath();
+                    CharSequence lbl = apkInfo.applicationInfo.loadLabel(getPackageManager());
+                    if (lbl != null && lbl.length() > 0) title[0] = lbl.toString();
+                }
                 Log.i(TAG, "APK package: " + apkPackageName);
             } else {
                 Log.e(TAG, "APK could not be parsed (corrupt or not an APK): " + apkUrl);
             }
+            showInstallNotification(title[0], "Installing…", -1, true);
 
             // Install via PackageInstaller API
             PackageInstaller installer = getPackageManager().getPackageInstaller();
@@ -1927,6 +1954,27 @@ public class MdmService extends Service {
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .build();
+    }
+
+    /**
+     * Posts/updates the app download+install progress notification (id 1002, separate from
+     * the persistent service notification). While ongoing it shows a progress bar —
+     * determinate when {@code percent >= 0}, indeterminate otherwise; the final result is
+     * posted with {@code ongoing=false} so the user can dismiss it. Thread-safe.
+     */
+    private void showInstallNotification(String title, String text, int percent, boolean ongoing) {
+        Notification.Builder b = new Notification.Builder(this, CHANNEL_ID)
+                .setContentTitle(title != null && !title.isEmpty() ? title : "App install")
+                .setContentText(text)
+                .setSmallIcon(ongoing ? android.R.drawable.stat_sys_download
+                                      : android.R.drawable.stat_sys_download_done)
+                .setOnlyAlertOnce(true)
+                .setOngoing(ongoing);
+        if (ongoing) {
+            if (percent >= 0) b.setProgress(100, percent, false);
+            else b.setProgress(0, 0, true); // indeterminate (installing / unknown size)
+        }
+        getSystemService(NotificationManager.class).notify(INSTALL_NOTIFICATION_ID, b.build());
     }
 
     @Override
