@@ -34,6 +34,7 @@ import java.util.zip.CRC32;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
@@ -243,7 +244,11 @@ public class MdmService extends Service {
             intervalMs = Math.max(intervalMs, HTTP_SAFETY_NET_MS);
         }
 
-        long triggerAt = SystemClock.elapsedRealtime() + intervalMs;
+        // Add up to +20% jitter so ~900 devices that boot / restore power / reconnect together
+        // don't fire their poll alarm in lockstep and stampede the server every cycle. Only
+        // lengthens the interval (never below the intended cadence).
+        long jitter = ThreadLocalRandom.current().nextLong((intervalMs / 5) + 1);
+        long triggerAt = SystemClock.elapsedRealtime() + intervalMs + jitter;
         if (powered) {
             // Powered (kiosk on a charger): keep exact, responsive wakeups.
             alarmManager.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerAt, pollIntent);

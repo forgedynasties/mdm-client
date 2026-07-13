@@ -115,7 +115,12 @@ public class MdmWebSocketClient {
                 closeSocket();
             }
             if (!running) break;
-            long delay = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
+            // Equal jitter on the backoff: without it, ~900 devices dropped by a server
+            // restart/deploy all retry at exactly 1s,2s,4s,8s,30s in lockstep, hammering the
+            // server in synchronized surges. Spreading each delay across [base/2, base] breaks
+            // the lockstep so reconnects fan out across the window.
+            long base = BACKOFF_MS[Math.min(reconnectAttempt, BACKOFF_MS.length - 1)];
+            long delay = base / 2 + (long) secureRandom.nextInt((int) (base / 2) + 1);
             Log.i(TAG, "Reconnecting in " + (delay / 1000) + "s (attempt " + (reconnectAttempt + 1) + ")");
             reconnectAttempt++;
             try {
