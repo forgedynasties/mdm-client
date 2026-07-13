@@ -54,8 +54,8 @@ public class MdmWebSocketClient {
     private volatile Thread loopThread;
     private volatile Socket socket;
     private volatile OutputStream outputStream;
-    private int reconnectAttempt = 0;
-    private long connectedAt = 0;
+    private volatile int reconnectAttempt = 0;   // read by the watchdog thread + loop thread
+    private volatile long connectedAt = 0;       // non-atomic 64-bit read across threads without volatile
 
     // Connection health tracking
     private volatile long lastDataReceivedAt = 0;

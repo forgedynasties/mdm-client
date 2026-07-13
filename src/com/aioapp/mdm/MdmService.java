@@ -33,7 +33,6 @@ import java.util.Set;
 import java.util.zip.CRC32;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -70,8 +69,8 @@ public class MdmService extends Service {
     private static final int MAX_LOGCAT_STREAMS = 3;
     private android.os.PowerManager.WakeLock remoteWakeLock;  // keeps the screen on during a remote session
     private static final long REMOTE_WAKE_TIMEOUT_MS = 30 * 60 * 1000L;  // safety cap so a dropped session can't pin the screen
-    private MdmWebSocketClient wsClient;
-    private JSONArray cachedInstalledApps = null;
+    private volatile MdmWebSocketClient wsClient;      // published from startWebSocket, read on many threads
+    private volatile JSONArray cachedInstalledApps = null;  // invalidated from a package-change receiver thread
     private BroadcastReceiver packageChangeReceiver;
     private String lastNotificationText = "";
     // Control-plane pool: short tasks (check-ins, telemetry, acks, config, input, pings).
@@ -156,11 +155,19 @@ public class MdmService extends Service {
         // ack/telemetry task if the pool ever saturates. Long ops live on heavyExecutor.
         executor = new ThreadPoolExecutor(2, 4, 60, TimeUnit.SECONDS,
                 new LinkedBlockingQueue<>(32), new ThreadPoolExecutor.CallerRunsPolicy());
-        heavyExecutor = Executors.newCachedThreadPool(r -> {
-            Thread t = new Thread(r, "mdm-heavy");
-            t.setDaemon(true);
-            return t;
-        });
+        // Bounded (was an unbounded cached pool). A flood of long commands — installs each
+        // block up to 180s, shells up to 30s — could otherwise spawn threads without limit and
+        // OOM / exhaust fds on a system-UID process. 16 threads + a 32-deep queue is far more
+        // than any real command load; genuine overflow is logged and the task dropped (the
+        // server re-sends unacked commands).
+        heavyExecutor = new ThreadPoolExecutor(4, 16, 60, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(32),
+                r -> {
+                    Thread t = new Thread(r, "mdm-heavy");
+                    t.setDaemon(true);
+                    return t;
+                },
+                (r, ex) -> Log.w(TAG, "heavy task rejected — pool saturated (possible command flood)"));
         apiService = new MdmApiService();
         connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
@@ -1490,10 +1497,13 @@ public class MdmService extends Service {
                 SystemPropertiesProxy.get("ro.boot.bootreason", "")));
         extra.put("boot_id", getBootId());
         extra.put("crash_events", getRecentCrashEvents());
-        // Include OTA progress if an update is in progress
-        if (otaUpdateManager != null && otaUpdateManager.isActive() && otaCommandId != null) {
+        // Include OTA progress if an update is in progress. Snapshot otaCommandId once: the OTA
+        // listener nulls it on a binder callback thread, so re-reading the field after the
+        // null-check could NPE at the put() below.
+        String otaId = otaCommandId;
+        if (otaUpdateManager != null && otaUpdateManager.isActive() && otaId != null) {
             JSONObject otaProgress = new JSONObject();
-            otaProgress.put("command_id", otaCommandId);
+            otaProgress.put("command_id", otaId);
             otaProgress.put("phase", otaUpdateManager.getCurrentPhase());
             otaProgress.put("percent", otaUpdateManager.getCurrentPercent());
             extra.put("ota_progress", otaProgress);
