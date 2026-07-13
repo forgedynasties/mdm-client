@@ -25,9 +25,12 @@ public class MdmApiService {
     private static final long DEFAULT_POLL_INTERVAL_MS = 30_000;
     private static final Random JITTER = new Random();
 
-    private String apiBaseUrl = resolveBaseUrl();
-    private long pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
-    private int consecutiveFailures = 0;
+    private volatile String apiBaseUrl = resolveBaseUrl();
+    // Written on the executor thread (applyConfig / checkin), read on the alarm thread.
+    private volatile long pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
+    private volatile int consecutiveFailures = 0;
+    // One-shot delay requested by the server via a 429/503 Retry-After; consumed by scheduleNextPoll.
+    private volatile long retryAfterMs = 0;
 
     public MdmApiService() {}
 
@@ -46,6 +49,13 @@ public class MdmApiService {
     public String getApiBaseUrl() { return apiBaseUrl; }
 
     public long getPollInterval() { return pollIntervalMs; }
+
+    /** One-shot delay requested by the server via a 429/503 Retry-After, in ms (0 if none). Consumed. */
+    public long consumeRetryAfterMs() {
+        long v = retryAfterMs;
+        retryAfterMs = 0;
+        return v;
+    }
 
     public void setPollInterval(long ms) { pollIntervalMs = ms; }
 
@@ -81,6 +91,18 @@ public class MdmApiService {
                 }
                 if (result.code == HttpURLConnection.HTTP_UNAUTHORIZED) {
                     Log.e(TAG, "Checkin 401: invalid API key");
+                    return null;
+                }
+                if (result.code == 429 || result.code == HttpURLConnection.HTTP_UNAVAILABLE) {
+                    // Server is shedding load. Burning the fast retries here only deepens the
+                    // overload — stop, honor Retry-After for the next poll, and count it as a
+                    // failure so the alarm backoff engages.
+                    if (result.retryAfterSecs > 0) {
+                        retryAfterMs = Math.max(retryAfterMs, result.retryAfterSecs * 1000L);
+                    }
+                    consecutiveFailures++;
+                    Log.w(TAG, "Checkin rate-limited (HTTP " + result.code + "), Retry-After="
+                            + result.retryAfterSecs + "s — backing off");
                     return null;
                 }
                 Log.w(TAG, "Checkin attempt " + (attempt + 1) + " failed: HTTP " + result.code);
@@ -177,6 +199,7 @@ public class MdmApiService {
     private static class PostResult {
         final int code;
         final String body;
+        int retryAfterSecs = -1; // parsed from Retry-After on 429/503, else -1
         PostResult(int code, String body) { this.code = code; this.body = body; }
     }
 
@@ -218,9 +241,16 @@ public class MdmApiService {
             try (BufferedReader br = new BufferedReader(
                     new InputStreamReader(stream, StandardCharsets.UTF_8))) {
                 String line;
-                while ((line = br.readLine()) != null) sb.append(line);
+                // Cap the read: a malfunctioning/hostile server (or a MITM) returning a giant body
+                // must not OOM the service. 256 KB is far more than any check-in/ack response.
+                while ((line = br.readLine()) != null && sb.length() <= 256 * 1024) sb.append(line);
             } catch (Exception ignored) {}
         }
-        return new PostResult(code, sb.toString());
+        PostResult result = new PostResult(code, sb.toString());
+        if (code == 429 || code == HttpURLConnection.HTTP_UNAVAILABLE) {
+            try { result.retryAfterSecs = Integer.parseInt(conn.getHeaderField("Retry-After").trim()); }
+            catch (Exception ignored) { /* absent or HTTP-date form — leave -1 */ }
+        }
+        return result;
     }
 }

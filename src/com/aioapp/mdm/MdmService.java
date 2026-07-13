@@ -243,6 +243,9 @@ public class MdmService extends Service {
     private void scheduleNextPoll() {
         long intervalMs = getAdaptivePollInterval() * apiService.getBackoffMultiplier();
 
+        // If the server asked us to slow down (429/503 Retry-After), never poll sooner than that.
+        intervalMs = Math.max(intervalMs, apiService.consumeRetryAfterMs());
+
         boolean powered = isOnExternalPower();
         boolean wsHealthy = wsClient != null && wsClient.isConnected()
                 && wsClient.getSecsSinceLastData() <= STALE_WS_THRESHOLD_SECS;
