@@ -30,6 +30,20 @@ public class KioskManager {
             String pkg = config.optString("kiosk_package", "");
 
             if (enabled && !pkg.isEmpty()) {
+                // Verify the package is installed and launchable BEFORE imposing lock-task.
+                // Previously the policy was set (and home/status bar hidden) first, then the
+                // launch intent checked — so a missing/typo'd/uninstalled kiosk package trapped
+                // the device on a package it couldn't launch, with no local way out (only a
+                // server kiosk_enabled=false could recover it, and this config is re-applied on
+                // every boot → persistent brick). Bail out and clear lock-task if not launchable.
+                Intent intent = ctx.getPackageManager().getLaunchIntentForPackage(pkg);
+                if (intent == null) {
+                    Log.w(TAG, "Kiosk package not installed/launchable, refusing lock-task: " + pkg);
+                    stopSystemLockTask();
+                    dpm.setLockTaskPackages(admin, new String[]{});
+                    return;
+                }
+
                 // 1. Whitelist the package for lock task mode
                 dpm.setLockTaskPackages(admin, new String[]{pkg});
 
@@ -46,16 +60,11 @@ public class KioskManager {
                 //    This is the correct approach for device owners. Do NOT use
                 //    ActivityTaskManager.startSystemLockTaskMode() -- that triggers
                 //    screen pinning (weaker mode with "unpin" toast).
-                Intent intent = ctx.getPackageManager().getLaunchIntentForPackage(pkg);
-                if (intent != null) {
-                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                    ActivityOptions options = ActivityOptions.makeBasic();
-                    options.setLockTaskEnabled(true);
-                    ctx.startActivity(intent, options.toBundle());
-                    Log.i(TAG, "Launched " + pkg + " in lock task mode");
-                } else {
-                    Log.w(TAG, "No launch intent for kiosk package: " + pkg);
-                }
+                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                ActivityOptions options = ActivityOptions.makeBasic();
+                options.setLockTaskEnabled(true);
+                ctx.startActivity(intent, options.toBundle());
+                Log.i(TAG, "Launched " + pkg + " in lock task mode");
                 Log.i(TAG, "Kiosk enabled: pkg=" + pkg);
             } else {
                 stopSystemLockTask();
