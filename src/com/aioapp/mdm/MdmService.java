@@ -165,9 +165,13 @@ public class MdmService extends Service {
         connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
         adminComponent = new ComponentName(this, MdmAdminReceiver.class);
-        ensureDeviceOwner();
+        // startForeground MUST be called within ~5s of startForegroundService or the OS crashes
+        // the process (ForegroundServiceDidNotStartInTimeAllowedException). ensureDeviceOwner()
+        // makes synchronous DPM binder calls that can stall past 5s on a cold fleet boot, so
+        // promote to foreground FIRST, then do provisioning.
         createNotificationChannel();
         startForeground(NOTIFICATION_ID, buildNotification("MDM service running"));
+        ensureDeviceOwner();
         batteryReceiver = new BroadcastReceiver() {
             @Override public void onReceive(Context context, Intent intent) {
                 cachedBatteryIntent = intent;

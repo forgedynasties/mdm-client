@@ -26,16 +26,19 @@ public class BootReceiver extends BroadcastReceiver {
                 Log.e(TAG, "Failed to start MdmService: " + e.getMessage(), e);
             }
 
-            JSONObject savedConfig = KioskManager.loadConfig(context);
-            if (savedConfig != null) {
-                try {
+            // loadConfig + apply are both inside the try: on LOCKED_BOOT_COMPLETED (Direct Boot)
+            // loadConfig now reads device-protected storage, but keep the whole block guarded so
+            // any failure here can never abort the boot handler (which also starts the service).
+            try {
+                JSONObject savedConfig = KioskManager.loadConfig(context);
+                if (savedConfig != null) {
                     DevicePolicyManager dpm = (DevicePolicyManager)
                             context.getSystemService(Context.DEVICE_POLICY_SERVICE);
                     ComponentName admin = new ComponentName(context, MdmAdminReceiver.class);
                     KioskManager.apply(context, dpm, admin, savedConfig);
-                } catch (Exception e) {
-                    Log.e(TAG, "Failed to apply kiosk config on boot: " + e.getMessage(), e);
                 }
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to apply kiosk config on boot: " + e.getMessage(), e);
             }
         }
     }

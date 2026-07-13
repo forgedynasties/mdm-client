@@ -77,8 +77,20 @@ public class KioskManager {
         }
     }
 
+    /**
+     * Kiosk config must be readable during Direct Boot (before the user unlocks) so lock-task
+     * is re-applied on the LOCKED_BOOT_COMPLETED path — reading credential-encrypted prefs there
+     * throws and left headless devices out of kiosk after every reboot. Use device-protected
+     * storage and migrate any prefs written by the old (credential-encrypted) build once.
+     */
+    private static Context prefsContext(Context ctx) {
+        Context de = ctx.createDeviceProtectedStorageContext();
+        de.moveSharedPreferencesFrom(ctx, PREFS_NAME); // one-time CE->DE migration; no-op afterward
+        return de;
+    }
+
     public static void saveConfig(Context ctx, JSONObject config) {
-        ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        prefsContext(ctx).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .edit()
                 .putString(KEY_CONFIG, config.toString())
                 .apply();
@@ -86,7 +98,7 @@ public class KioskManager {
 
     /** Returns the last saved config, or null if none has been received yet. */
     public static JSONObject loadConfig(Context ctx) {
-        String json = ctx.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        String json = prefsContext(ctx).getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
                 .getString(KEY_CONFIG, null);
         if (json == null) return null;
         try {
