@@ -698,9 +698,11 @@ public class MdmService extends Service {
                 break;
             case "start_capture":
                 heavyExecutor.submit(() -> {
-                    int quality = msg.optInt("quality", 60);
-                    double scale = msg.optDouble("scale", 0.5);
-                    int maxFps = msg.optInt("max_fps", 10);
+                    // Clamp server-supplied capture params so an out-of-range value can't peg CPU
+                    // or flood the WS (a bad/hostile server shouldn't be able to melt the device).
+                    int quality = Math.max(1, Math.min(100, msg.optInt("quality", 60)));
+                    double scale = Math.max(0.1, Math.min(1.0, msg.optDouble("scale", 0.5)));
+                    int maxFps = Math.max(1, Math.min(30, msg.optInt("max_fps", 10)));
                     if (!isCapturing) {
                         isCapturing = true;
                         acquireRemoteWakeLock();
@@ -907,9 +909,10 @@ public class MdmService extends Service {
                 break;
             }
             case "start_capture": {
-                int quality = payload.optInt("quality", 60);
-                double scale = payload.optDouble("scale", 0.5);
-                int maxFps = payload.optInt("max_fps", 10);
+                // Clamp server-supplied capture params (see the WS start_capture handler).
+                int quality = Math.max(1, Math.min(100, payload.optInt("quality", 60)));
+                double scale = Math.max(0.1, Math.min(1.0, payload.optDouble("scale", 0.5)));
+                int maxFps = Math.max(1, Math.min(30, payload.optInt("max_fps", 10)));
                 if (!isCapturing) {
                     isCapturing = true;
                     acquireRemoteWakeLock();

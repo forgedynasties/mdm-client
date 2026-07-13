@@ -24,6 +24,11 @@ public class MdmWebSocketClient {
     private static final long[] BACKOFF_MS = {1_000, 2_000, 4_000, 8_000, 30_000};
     // Reset backoff if connected for this long without dropping
     private static final long BACKOFF_RESET_MS = 60_000;
+    // Hard cap on an inbound frame's declared length before we allocate for it. Server->device
+    // frames are JSON commands + small capture-control messages; 8 MB is far more than enough.
+    // Without this, a 127-length frame declaring a huge/negative size would OutOfMemoryError a
+    // system-UID process straight off the wire.
+    private static final long MAX_FRAME_BYTES = 8L * 1024 * 1024;
 
     interface Listener {
         void onMessage(JSONObject message);
@@ -144,6 +149,15 @@ public class MdmWebSocketClient {
             }
             ssl.connect(new InetSocketAddress(host, port), 10_000);
             ssl.startHandshake();
+            // A raw SSLSocket validates the cert CHAIN but NOT that it was issued for `host`,
+            // so without this any CA-valid cert (incl. an attacker's for a different domain)
+            // would be accepted — a MITM of the entire command channel. Verify the hostname
+            // explicitly and abort on mismatch.
+            if (!javax.net.ssl.HttpsURLConnection.getDefaultHostnameVerifier()
+                    .verify(host, ssl.getSession())) {
+                throw new javax.net.ssl.SSLPeerUnverifiedException(
+                        "WS TLS hostname verification failed for " + host);
+            }
             if (android.os.Build.VERSION.SDK_INT >= 29) {
                 Log.d(TAG, "ALPN negotiated: " + ssl.getApplicationProtocol());
             }
@@ -219,6 +233,10 @@ public class MdmWebSocketClient {
                 payloadLen = dis.readUnsignedShort();
             } else if (payloadLen == 127) {
                 payloadLen = dis.readLong();
+            }
+
+            if (payloadLen < 0 || payloadLen > MAX_FRAME_BYTES) {
+                throw new IOException("WS frame too large or invalid: " + payloadLen);
             }
 
             byte[] maskKey = masked ? new byte[4] : null;
