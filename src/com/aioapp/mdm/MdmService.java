@@ -33,8 +33,6 @@ import java.util.Set;
 import java.util.zip.CRC32;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -115,18 +113,15 @@ public class MdmService extends Service {
     private long wlcLastMs = 0;
     private static final long WLC_CACHE_MS = 120_000;
     private final Object wlcLock = new Object();          // guards cachedWlcStatus / wlcLastMs
-    // The Qi charging pad exposes no system broadcast (unlike charging, which rides
-    // ACTION_BATTERY_CHANGED), so a guest device being placed on / removed from the pad is
-    // invisible until the next telemetry read. A short GPIO poll edge-detects that change and
-    // pushes immediately, making wlc_status as responsive as the charging state.
-    private ScheduledExecutorService wlcWatcher;
-    // Poll fast while the pad is powered (near-realtime, matching charging responsiveness) and
-    // slowly on battery — there the pad GPIO itself lags, so fast reads only waste power.
-    private static final long WLC_WATCH_POWERED_MS = 1_000;
-    private static final long WLC_WATCH_BATTERY_MS = 15_000;
-    private static final long WLC_LOG_HEARTBEAT_MS = 30_000; // steady-state log cadence (changes always log)
-    private volatile int lastWatchedWlc = Integer.MIN_VALUE;  // last value the watcher observed
-    private long wlcLastLogMs = 0;                            // watcher thread only
+    // The Qi pad's guest-presence state is now published by the OS as a sticky, protected
+    // broadcast (WlcService in system_server), exactly like charging rides ACTION_BATTERY_CHANGED.
+    // We subscribe instead of polling the GPIO on a timer: registerReceiver() hands back the
+    // current state synchronously, and every subsequent transition pushes telemetry immediately.
+    private BroadcastReceiver wlcReceiver;
+    private static final String ACTION_WLC_GUEST_STATE_CHANGED =
+            "com.aioapp.action.WLC_GUEST_STATE_CHANGED";
+    private static final String EXTRA_WLC_STATE = "state";
+    private volatile int lastWatchedWlc = Integer.MIN_VALUE;  // last value the receiver observed
 
     // App list delta
     private String lastAppsHash = null;
@@ -240,7 +235,25 @@ public class MdmService extends Service {
 
         registerNetworkCallback();
         registerPackageChangeReceiver();
-        startWlcWatcher();
+
+        // Subscribe to the Qi pad's guest-presence broadcast. It's sticky, so registerReceiver()
+        // returns the current state as of now — adopt that seed WITHOUT pushing telemetry, so the
+        // first real transition (not service start) is what triggers a push.
+        wlcReceiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context context, Intent intent) {
+                handleWlcIntent(intent);
+            }
+        };
+        Intent stickyWlc = registerReceiver(wlcReceiver,
+                new IntentFilter(ACTION_WLC_GUEST_STATE_CHANGED));
+        if (stickyWlc != null) {
+            int w = stickyWlc.getIntExtra(EXTRA_WLC_STATE, -1);
+            synchronized (wlcLock) {
+                cachedWlcStatus = w;
+                wlcLastMs = SystemClock.elapsedRealtime();
+            }
+            lastWatchedWlc = w;
+        }
     }
 
     @Override
@@ -1913,66 +1926,29 @@ public class MdmService extends Service {
         }
     }
 
-    /** Human-readable label for a wlc_status value, for logs. */
-    private static String wlcLabel(int status) {
-        switch (status) {
-            case 1:  return "on-pad";
-            case 0:  return "idle";
-            default: return "unreadable";
-        }
-    }
-
-    /** Start the WLC watcher: polls the Qi pad's guest-detection GPIO and pushes telemetry the
-     *  instant it changes, so placing/removing a device on the pad is reflected in ~1s while
-     *  powered instead of waiting out the telemetry cache + next check-in. Each poll also
-     *  refreshes the wlc cache so the HTTP safety-net path sees a fresh value too. */
-    private void startWlcWatcher() {
-        wlcWatcher = Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "mdm-wlc-watch");
-            t.setDaemon(true);
-            return t;
-        });
-        Log.i(TAG, "WLC watcher started — polling gpio27 every " + (WLC_WATCH_POWERED_MS / 1000)
-                + "s powered / " + (WLC_WATCH_BATTERY_MS / 1000) + "s on battery");
-        wlcWatcher.schedule(this::wlcTick, WLC_WATCH_POWERED_MS, TimeUnit.MILLISECONDS);
-    }
-
-    /** One WLC poll: read the pad GPIO, refresh the cache, push telemetry on change, then
-     *  self-reschedule at a cadence matched to the current power state (fast when powered for
-     *  near-realtime, slow on battery). Confirmable via: adb logcat -s MdmService:I | grep WLC */
-    private void wlcTick() {
+    /** Handle a WLC guest-presence broadcast: refresh the wlc cache (so the HTTP safety-net path
+     *  sees a fresh value too) and push telemetry the instant the pad state changes, so placing /
+     *  removing a device on the pad is reflected immediately instead of waiting out the telemetry
+     *  cache + next check-in. The seed value adopted in onCreate() is guarded against here via
+     *  lastWatchedWlc == Integer.MIN_VALUE, so a process restart never emits a spurious push.
+     *  Confirmable via: adb logcat -s MdmService:I | grep "WLC pad state changed" */
+    private void handleWlcIntent(Intent intent) {
         try {
-            boolean powered = isOnExternalPower();
-            int w = readWlcStatusUncached();
+            int w = intent.getIntExtra(EXTRA_WLC_STATE, -1);
             synchronized (wlcLock) {
                 cachedWlcStatus = w;
                 wlcLastMs = SystemClock.elapsedRealtime();
             }
-            boolean first = lastWatchedWlc == Integer.MIN_VALUE;
-            boolean changed = w != lastWatchedWlc && !first;
-            long now = SystemClock.elapsedRealtime();
-            // Log every real change, plus a periodic heartbeat — so the 1s powered cadence
-            // doesn't flood logcat while the state is steady.
-            if (changed || now - wlcLastLogMs >= WLC_LOG_HEARTBEAT_MS) {
-                Log.i(TAG, "WLC gpio27=" + w + " (" + wlcLabel(w) + ") powered=" + powered
-                        + (changed ? "  <-- CHANGED from " + lastWatchedWlc + ", pushing telemetry" : ""));
-                wlcLastLogMs = now;
-            }
             if (w != lastWatchedWlc) {
+                boolean first = lastWatchedWlc == Integer.MIN_VALUE;
                 lastWatchedWlc = w;
-                if (!first) sendTelemetryOverWs();
+                if (!first) {
+                    Log.i(TAG, "WLC pad state changed: " + w + " — pushing immediate telemetry");
+                    sendTelemetryOverWs();
+                }
             }
         } catch (Exception e) {
-            Log.e(TAG, "WLC watcher error: " + e.getMessage());
-        } finally {
-            try {
-                if (wlcWatcher != null && !wlcWatcher.isShutdown()) {
-                    long next = isOnExternalPower() ? WLC_WATCH_POWERED_MS : WLC_WATCH_BATTERY_MS;
-                    wlcWatcher.schedule(this::wlcTick, next, TimeUnit.MILLISECONDS);
-                }
-            } catch (java.util.concurrent.RejectedExecutionException ignored) {
-                // executor shutting down — stop rescheduling
-            }
+            Log.e(TAG, "wlc receiver error: " + e.getMessage());
         }
     }
 
@@ -2102,7 +2078,9 @@ public class MdmService extends Service {
         }
         executor.shutdownNow();
         if (heavyExecutor != null) heavyExecutor.shutdownNow();
-        if (wlcWatcher != null) wlcWatcher.shutdownNow();
+        if (wlcReceiver != null) {
+            try { unregisterReceiver(wlcReceiver); } catch (Exception ignored) {}
+        }
         if (wsClient != null) wsClient.stop();
         if (networkCallback != null) {
             try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) {}
