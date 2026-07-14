@@ -1903,8 +1903,17 @@ public class MdmService extends Service {
             String v = line == null ? "" : line.replace("\0", "").trim();
             return v.equals("1") ? 1 : (v.equals("0") ? 0 : -1);
         } catch (Exception e) {
-            Log.e(TAG, "getWlcStatus error: " + e.getMessage());
+            Log.e(TAG, "WLC gpio27 read error: " + e.getMessage());
             return -1;
+        }
+    }
+
+    /** Human-readable label for a wlc_status value, for logs. */
+    private static String wlcLabel(int status) {
+        switch (status) {
+            case 1:  return "on-pad";
+            case 0:  return "idle";
+            default: return "unreadable";
         }
     }
 
@@ -1918,6 +1927,7 @@ public class MdmService extends Service {
             t.setDaemon(true);
             return t;
         });
+        Log.i(TAG, "WLC watcher started — polling gpio27 every " + (WLC_WATCH_MS / 1000) + "s");
         wlcWatcher.scheduleWithFixedDelay(() -> {
             try {
                 int w = readWlcStatusUncached();
@@ -1925,16 +1935,18 @@ public class MdmService extends Service {
                     cachedWlcStatus = w;
                     wlcLastMs = SystemClock.elapsedRealtime();
                 }
+                boolean changed = w != lastWatchedWlc && lastWatchedWlc != Integer.MIN_VALUE;
+                // Per-tick line so the raw pad state is trivially confirmable via:
+                //   adb logcat -s MdmService:I | grep WLC
+                Log.i(TAG, "WLC gpio27=" + w + " (" + wlcLabel(w) + ") powered=" + isOnExternalPower()
+                        + (changed ? "  <-- CHANGED from " + lastWatchedWlc + ", pushing telemetry" : ""));
                 if (w != lastWatchedWlc) {
                     boolean first = lastWatchedWlc == Integer.MIN_VALUE;
                     lastWatchedWlc = w;
-                    if (!first) {
-                        Log.i(TAG, "WLC pad state changed: " + w + " — pushing immediate telemetry");
-                        sendTelemetryOverWs();
-                    }
+                    if (!first) sendTelemetryOverWs();
                 }
             } catch (Exception e) {
-                Log.e(TAG, "wlc watcher error: " + e.getMessage());
+                Log.e(TAG, "WLC watcher error: " + e.getMessage());
             }
         }, WLC_WATCH_MS, WLC_WATCH_MS, TimeUnit.MILLISECONDS);
     }
