@@ -33,6 +33,8 @@ import java.util.Set;
 import java.util.zip.CRC32;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -112,6 +114,14 @@ public class MdmService extends Service {
     private int cachedWlcStatus = -1;
     private long wlcLastMs = 0;
     private static final long WLC_CACHE_MS = 120_000;
+    private final Object wlcLock = new Object();          // guards cachedWlcStatus / wlcLastMs
+    // The Qi charging pad exposes no system broadcast (unlike charging, which rides
+    // ACTION_BATTERY_CHANGED), so a guest device being placed on / removed from the pad is
+    // invisible until the next telemetry read. A short GPIO poll edge-detects that change and
+    // pushes immediately, making wlc_status as responsive as the charging state.
+    private ScheduledExecutorService wlcWatcher;
+    private static final long WLC_WATCH_MS = 10_000;
+    private volatile int lastWatchedWlc = Integer.MIN_VALUE; // last value the watcher observed
 
     // App list delta
     private String lastAppsHash = null;
@@ -186,6 +196,9 @@ public class MdmService extends Service {
                 if (lastChargingState != -1 && charging != lastChargingState) {
                     Log.i(TAG, "Charging state changed: " + lastChargingState + " -> " + charging
                             + " — pushing immediate telemetry");
+                    // Power state gates the pad read; drop the wlc cache so the imminent push
+                    // carries a fresh reading rather than the last on-battery 0.
+                    synchronized (wlcLock) { wlcLastMs = 0; }
                     sendTelemetryOverWs();
                 }
                 lastChargingState = charging;
@@ -222,6 +235,7 @@ public class MdmService extends Service {
 
         registerNetworkCallback();
         registerPackageChangeReceiver();
+        startWlcWatcher();
     }
 
     @Override
@@ -1862,29 +1876,65 @@ public class MdmService extends Service {
 
     private int getWlcStatus() {
         long now = SystemClock.elapsedRealtime();
-        if (wlcLastMs > 0 && now - wlcLastMs < WLC_CACHE_MS) return cachedWlcStatus;
-        // On battery there is no charging at all, so the wireless pad is necessarily
-        // disconnected — skip the GPIO read entirely.
-        if (!isOnExternalPower()) {
-            cachedWlcStatus = 0;
-            wlcLastMs = now;
-            return cachedWlcStatus;
+        synchronized (wlcLock) {
+            if (wlcLastMs > 0 && now - wlcLastMs < WLC_CACHE_MS) return cachedWlcStatus;
         }
-        // Single instantaneous read: 1 = guest device on the pad, 0 = none, -1 = unreadable.
-        // We no longer sample over a 500 ms window to detect the toggling "disconnected"
-        // state (formerly status 2): no alert consumes it anymore, and the server's daily
-        // wlc_guest_frac only counts wlc_status == 1 (pad_readable just needs >= 0).
+        int v = readWlcStatusUncached();
+        synchronized (wlcLock) {
+            cachedWlcStatus = v;
+            wlcLastMs = now;
+        }
+        return v;
+    }
+
+    /** Instantaneous, uncached read of the wireless-charging pad's guest-detection GPIO:
+     *  1 = guest device on the pad, 0 = none, -1 = unreadable. On battery the pad has no
+     *  power and is necessarily disconnected, so skip the GPIO read and report 0.
+     *  We no longer sample over a 500 ms window to detect the toggling "disconnected"
+     *  state (formerly status 2): no alert consumes it anymore, and the server's daily
+     *  wlc_guest_frac only counts wlc_status == 1 (pad_readable just needs >= 0). */
+    private int readWlcStatusUncached() {
+        if (!isOnExternalPower()) return 0;
         final String gpioPath = "/sys/devices/platform/soc/soc:customer_gpio/gpio27";
         try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(gpioPath))) {
             String line = reader.readLine();
             String v = line == null ? "" : line.replace("\0", "").trim();
-            cachedWlcStatus = v.equals("1") ? 1 : (v.equals("0") ? 0 : -1);
+            return v.equals("1") ? 1 : (v.equals("0") ? 0 : -1);
         } catch (Exception e) {
             Log.e(TAG, "getWlcStatus error: " + e.getMessage());
-            cachedWlcStatus = -1;
+            return -1;
         }
-        wlcLastMs = now;
-        return cachedWlcStatus;
+    }
+
+    /** Poll the Qi pad's guest-detection GPIO on a short cadence and push telemetry the
+     *  instant it changes, so placing/removing a device on the pad is reflected within
+     *  ~WLC_WATCH_MS instead of waiting out the telemetry cache + next check-in. Each tick
+     *  also refreshes the wlc cache so the HTTP safety-net path sees a fresh value too. */
+    private void startWlcWatcher() {
+        wlcWatcher = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "mdm-wlc-watch");
+            t.setDaemon(true);
+            return t;
+        });
+        wlcWatcher.scheduleWithFixedDelay(() -> {
+            try {
+                int w = readWlcStatusUncached();
+                synchronized (wlcLock) {
+                    cachedWlcStatus = w;
+                    wlcLastMs = SystemClock.elapsedRealtime();
+                }
+                if (w != lastWatchedWlc) {
+                    boolean first = lastWatchedWlc == Integer.MIN_VALUE;
+                    lastWatchedWlc = w;
+                    if (!first) {
+                        Log.i(TAG, "WLC pad state changed: " + w + " — pushing immediate telemetry");
+                        sendTelemetryOverWs();
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "wlc watcher error: " + e.getMessage());
+            }
+        }, WLC_WATCH_MS, WLC_WATCH_MS, TimeUnit.MILLISECONDS);
     }
 
     private double getStorageFreeGb() {
@@ -2013,6 +2063,7 @@ public class MdmService extends Service {
         }
         executor.shutdownNow();
         if (heavyExecutor != null) heavyExecutor.shutdownNow();
+        if (wlcWatcher != null) wlcWatcher.shutdownNow();
         if (wsClient != null) wsClient.stop();
         if (networkCallback != null) {
             try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) {}
