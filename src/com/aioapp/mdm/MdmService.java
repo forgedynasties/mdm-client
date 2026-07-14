@@ -120,8 +120,13 @@ public class MdmService extends Service {
     // invisible until the next telemetry read. A short GPIO poll edge-detects that change and
     // pushes immediately, making wlc_status as responsive as the charging state.
     private ScheduledExecutorService wlcWatcher;
-    private static final long WLC_WATCH_MS = 10_000;
-    private volatile int lastWatchedWlc = Integer.MIN_VALUE; // last value the watcher observed
+    // Poll fast while the pad is powered (near-realtime, matching charging responsiveness) and
+    // slowly on battery — there the pad GPIO itself lags, so fast reads only waste power.
+    private static final long WLC_WATCH_POWERED_MS = 1_000;
+    private static final long WLC_WATCH_BATTERY_MS = 15_000;
+    private static final long WLC_LOG_HEARTBEAT_MS = 30_000; // steady-state log cadence (changes always log)
+    private volatile int lastWatchedWlc = Integer.MIN_VALUE;  // last value the watcher observed
+    private long wlcLastLogMs = 0;                            // watcher thread only
 
     // App list delta
     private String lastAppsHash = null;
@@ -1917,38 +1922,58 @@ public class MdmService extends Service {
         }
     }
 
-    /** Poll the Qi pad's guest-detection GPIO on a short cadence and push telemetry the
-     *  instant it changes, so placing/removing a device on the pad is reflected within
-     *  ~WLC_WATCH_MS instead of waiting out the telemetry cache + next check-in. Each tick
-     *  also refreshes the wlc cache so the HTTP safety-net path sees a fresh value too. */
+    /** Start the WLC watcher: polls the Qi pad's guest-detection GPIO and pushes telemetry the
+     *  instant it changes, so placing/removing a device on the pad is reflected in ~1s while
+     *  powered instead of waiting out the telemetry cache + next check-in. Each poll also
+     *  refreshes the wlc cache so the HTTP safety-net path sees a fresh value too. */
     private void startWlcWatcher() {
         wlcWatcher = Executors.newSingleThreadScheduledExecutor(r -> {
             Thread t = new Thread(r, "mdm-wlc-watch");
             t.setDaemon(true);
             return t;
         });
-        Log.i(TAG, "WLC watcher started — polling gpio27 every " + (WLC_WATCH_MS / 1000) + "s");
-        wlcWatcher.scheduleWithFixedDelay(() -> {
-            try {
-                int w = readWlcStatusUncached();
-                synchronized (wlcLock) {
-                    cachedWlcStatus = w;
-                    wlcLastMs = SystemClock.elapsedRealtime();
-                }
-                boolean changed = w != lastWatchedWlc && lastWatchedWlc != Integer.MIN_VALUE;
-                // Per-tick line so the raw pad state is trivially confirmable via:
-                //   adb logcat -s MdmService:I | grep WLC
-                Log.i(TAG, "WLC gpio27=" + w + " (" + wlcLabel(w) + ") powered=" + isOnExternalPower()
-                        + (changed ? "  <-- CHANGED from " + lastWatchedWlc + ", pushing telemetry" : ""));
-                if (w != lastWatchedWlc) {
-                    boolean first = lastWatchedWlc == Integer.MIN_VALUE;
-                    lastWatchedWlc = w;
-                    if (!first) sendTelemetryOverWs();
-                }
-            } catch (Exception e) {
-                Log.e(TAG, "WLC watcher error: " + e.getMessage());
+        Log.i(TAG, "WLC watcher started — polling gpio27 every " + (WLC_WATCH_POWERED_MS / 1000)
+                + "s powered / " + (WLC_WATCH_BATTERY_MS / 1000) + "s on battery");
+        wlcWatcher.schedule(this::wlcTick, WLC_WATCH_POWERED_MS, TimeUnit.MILLISECONDS);
+    }
+
+    /** One WLC poll: read the pad GPIO, refresh the cache, push telemetry on change, then
+     *  self-reschedule at a cadence matched to the current power state (fast when powered for
+     *  near-realtime, slow on battery). Confirmable via: adb logcat -s MdmService:I | grep WLC */
+    private void wlcTick() {
+        try {
+            boolean powered = isOnExternalPower();
+            int w = readWlcStatusUncached();
+            synchronized (wlcLock) {
+                cachedWlcStatus = w;
+                wlcLastMs = SystemClock.elapsedRealtime();
             }
-        }, WLC_WATCH_MS, WLC_WATCH_MS, TimeUnit.MILLISECONDS);
+            boolean first = lastWatchedWlc == Integer.MIN_VALUE;
+            boolean changed = w != lastWatchedWlc && !first;
+            long now = SystemClock.elapsedRealtime();
+            // Log every real change, plus a periodic heartbeat — so the 1s powered cadence
+            // doesn't flood logcat while the state is steady.
+            if (changed || now - wlcLastLogMs >= WLC_LOG_HEARTBEAT_MS) {
+                Log.i(TAG, "WLC gpio27=" + w + " (" + wlcLabel(w) + ") powered=" + powered
+                        + (changed ? "  <-- CHANGED from " + lastWatchedWlc + ", pushing telemetry" : ""));
+                wlcLastLogMs = now;
+            }
+            if (w != lastWatchedWlc) {
+                lastWatchedWlc = w;
+                if (!first) sendTelemetryOverWs();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "WLC watcher error: " + e.getMessage());
+        } finally {
+            try {
+                if (wlcWatcher != null && !wlcWatcher.isShutdown()) {
+                    long next = isOnExternalPower() ? WLC_WATCH_POWERED_MS : WLC_WATCH_BATTERY_MS;
+                    wlcWatcher.schedule(this::wlcTick, next, TimeUnit.MILLISECONDS);
+                }
+            } catch (java.util.concurrent.RejectedExecutionException ignored) {
+                // executor shutting down — stop rescheduling
+            }
+        }
     }
 
     private double getStorageFreeGb() {
