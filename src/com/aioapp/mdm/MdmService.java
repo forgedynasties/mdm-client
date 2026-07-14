@@ -196,8 +196,8 @@ public class MdmService extends Service {
                 if (lastChargingState != -1 && charging != lastChargingState) {
                     Log.i(TAG, "Charging state changed: " + lastChargingState + " -> " + charging
                             + " — pushing immediate telemetry");
-                    // Power state gates the pad read; drop the wlc cache so the imminent push
-                    // carries a fresh reading rather than the last on-battery 0.
+                    // A power transition can change what the pad reports; drop the wlc cache
+                    // so the imminent push carries a fresh reading rather than a stale one.
                     synchronized (wlcLock) { wlcLastMs = 0; }
                     sendTelemetryOverWs();
                 }
@@ -1888,13 +1888,15 @@ public class MdmService extends Service {
     }
 
     /** Instantaneous, uncached read of the wireless-charging pad's guest-detection GPIO:
-     *  1 = guest device on the pad, 0 = none, -1 = unreadable. On battery the pad has no
-     *  power and is necessarily disconnected, so skip the GPIO read and report 0.
+     *  1 = guest device on the pad, 0 = none, -1 = unreadable. The GPIO is the authoritative
+     *  presence signal, so we read it regardless of the host's reported charging state — the
+     *  pad detects a guest even when the host itself shows no external power. (The former
+     *  "skip the read on battery" optimization assumed the pad only works while the host is on
+     *  external power, which is untrue for this hardware and reported a false 0.)
      *  We no longer sample over a 500 ms window to detect the toggling "disconnected"
      *  state (formerly status 2): no alert consumes it anymore, and the server's daily
      *  wlc_guest_frac only counts wlc_status == 1 (pad_readable just needs >= 0). */
     private int readWlcStatusUncached() {
-        if (!isOnExternalPower()) return 0;
         final String gpioPath = "/sys/devices/platform/soc/soc:customer_gpio/gpio27";
         try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(gpioPath))) {
             String line = reader.readLine();
