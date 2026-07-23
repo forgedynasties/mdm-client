@@ -33,6 +33,8 @@ import java.util.Set;
 import java.util.zip.CRC32;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
@@ -113,15 +115,32 @@ public class MdmService extends Service {
     private long wlcLastMs = 0;
     private static final long WLC_CACHE_MS = 120_000;
     private final Object wlcLock = new Object();          // guards cachedWlcStatus / wlcLastMs
-    // The Qi pad's guest-presence state is now published by the OS as a sticky, protected
-    // broadcast (WlcService in system_server), exactly like charging rides ACTION_BATTERY_CHANGED.
-    // We subscribe instead of polling the GPIO on a timer: registerReceiver() hands back the
-    // current state synchronously, and every subsequent transition pushes telemetry immediately.
-    private BroadcastReceiver wlcReceiver;
-    private static final String ACTION_WLC_GUEST_STATE_CHANGED =
-            "com.aioapp.action.WLC_GUEST_STATE_CHANGED";
-    private static final String EXTRA_WLC_STATE = "state";
-    private volatile int lastWatchedWlc = Integer.MIN_VALUE;  // last value the receiver observed
+    // The Qi charging pad exposes no system broadcast (unlike charging, which rides
+    // ACTION_BATTERY_CHANGED), so a guest device being placed on / removed from the pad is
+    // invisible until the next telemetry read. A short GPIO poll edge-detects that change and
+    // pushes immediately, making wlc_status as responsive as the charging state.
+    private ScheduledExecutorService wlcWatcher;
+    private static final long WLC_WATCH_MS = 1_000;
+    private volatile int lastWatchedWlc = Integer.MIN_VALUE; // last value the watcher observed
+
+    // Telling "no pad attached" from "guest placed/lifted" needs the line's rate of change,
+    // which no single read carries. Measured on gpio27 at 100 ms on two units: an unattached
+    // pad leaves the pin floating at ~2.7-2.8 Hz (324 and 338 edges per 60 s, half-period
+    // ~180 ms), while an attached pad is flat — 0 edges in 60 s, whether or not a guest is
+    // on it. Same signature on both units, so one threshold covers the fleet.
+    // 800 ms / 25 ms = 32 samples. Worst case across a full capture was 3 edges in any
+    // 800 ms window with no pad, against 0 with a pad, so 2 sits clear of both.
+    private static final long WLC_BURST_MS         = 800L;
+    private static final long WLC_BURST_STEP_MS    = 25L;
+    private static final int  WLC_BURST_EDGES      = 2;
+    // Once floating is latched, re-test only this often; that is what notices a pad being
+    // plugged in. Between tests the state is reported without touching sysfs.
+    private static final long WLC_FLOAT_RECHECK_MS = 30_000L;
+
+    // Watcher thread only, except wlcFloating, which other threads read.
+    private int lastRawWlc = Integer.MIN_VALUE;
+    private long wlcFloatCheckedAt = 0L;
+    private volatile boolean wlcFloating = false;
 
     // App list delta
     private String lastAppsHash = null;
@@ -235,25 +254,7 @@ public class MdmService extends Service {
 
         registerNetworkCallback();
         registerPackageChangeReceiver();
-
-        // Subscribe to the Qi pad's guest-presence broadcast. It's sticky, so registerReceiver()
-        // returns the current state as of now — adopt that seed WITHOUT pushing telemetry, so the
-        // first real transition (not service start) is what triggers a push.
-        wlcReceiver = new BroadcastReceiver() {
-            @Override public void onReceive(Context context, Intent intent) {
-                handleWlcIntent(intent);
-            }
-        };
-        Intent stickyWlc = registerReceiver(wlcReceiver,
-                new IntentFilter(ACTION_WLC_GUEST_STATE_CHANGED));
-        if (stickyWlc != null) {
-            int w = stickyWlc.getIntExtra(EXTRA_WLC_STATE, -1);
-            synchronized (wlcLock) {
-                cachedWlcStatus = w;
-                wlcLastMs = SystemClock.elapsedRealtime();
-            }
-            lastWatchedWlc = w;
-        }
+        startWlcWatcher();
     }
 
     @Override
@@ -1911,9 +1912,8 @@ public class MdmService extends Service {
      *  pad detects a guest even when the host itself shows no external power. (The former
      *  "skip the read on battery" optimization assumed the pad only works while the host is on
      *  external power, which is untrue for this hardware and reported a false 0.)
-     *  We no longer sample over a 500 ms window to detect the toggling "disconnected"
-     *  state (formerly status 2): no alert consumes it anymore, and the server's daily
-     *  wlc_guest_frac only counts wlc_status == 1 (pad_readable just needs >= 0). */
+     *  This is the bare line. Whether a pad is attached at all is a property of how the
+     *  line moves over time, not of any one sample — see classifyWlc(). */
     private int readWlcStatusUncached() {
         final String gpioPath = "/sys/devices/platform/soc/soc:customer_gpio/gpio27";
         try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(gpioPath))) {
@@ -1921,35 +1921,98 @@ public class MdmService extends Service {
             String v = line == null ? "" : line.replace("\0", "").trim();
             return v.equals("1") ? 1 : (v.equals("0") ? 0 : -1);
         } catch (Exception e) {
-            Log.e(TAG, "WLC gpio27 read error: " + e.getMessage());
+            Log.e(TAG, "getWlcStatus error: " + e.getMessage());
             return -1;
         }
     }
 
-    /** Handle a WLC guest-presence broadcast: refresh the wlc cache (so the HTTP safety-net path
-     *  sees a fresh value too) and push telemetry the instant the pad state changes, so placing /
-     *  removing a device on the pad is reflected immediately instead of waiting out the telemetry
-     *  cache + next check-in. The seed value adopted in onCreate() is guarded against here via
-     *  lastWatchedWlc == Integer.MIN_VALUE, so a process restart never emits a spurious push.
-     *  Confirmable via: adb logcat -s MdmService:I | grep "WLC pad state changed" */
-    private void handleWlcIntent(Intent intent) {
-        try {
-            int w = intent.getIntExtra(EXTRA_WLC_STATE, -1);
-            synchronized (wlcLock) {
-                cachedWlcStatus = w;
-                wlcLastMs = SystemClock.elapsedRealtime();
+    /** Sample gpio27 across WLC_BURST_MS and count 0<->1 transitions. Blocks the caller for
+     *  the length of the burst; only the watcher thread calls it. -1 reads are skipped
+     *  rather than counted, so a flaky sysfs read cannot masquerade as a floating line. */
+    private int wlcBurstEdges() {
+        int edges = 0;
+        int prev = readWlcStatusUncached();
+        long deadline = SystemClock.elapsedRealtime() + WLC_BURST_MS;
+        while (SystemClock.elapsedRealtime() < deadline) {
+            try {
+                Thread.sleep(WLC_BURST_STEP_MS);
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+                break;
             }
-            if (w != lastWatchedWlc) {
-                boolean first = lastWatchedWlc == Integer.MIN_VALUE;
-                lastWatchedWlc = w;
-                if (!first) {
-                    Log.i(TAG, "WLC pad state changed: " + w + " — pushing immediate telemetry");
-                    sendTelemetryOverWs();
-                }
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "wlc receiver error: " + e.getMessage());
+            int v = readWlcStatusUncached();
+            if (v < 0) continue;
+            if (prev >= 0 && v != prev) edges++;
+            prev = v;
         }
+        return edges;
+    }
+
+    /** Map a raw gpio27 read to the reported wlc_status:
+     *  1 = guest on pad, 0 = pad idle, 2 = no pad connected, -1 = unreadable.
+     *  Watcher thread only. */
+    private int classifyWlc(int raw) {
+        long now = SystemClock.elapsedRealtime();
+        if (raw < 0) return -1;
+
+        if (wlcFloating) {
+            if (now - wlcFloatCheckedAt < WLC_FLOAT_RECHECK_MS) return 2;
+            wlcFloatCheckedAt = now;
+            if (wlcBurstEdges() >= WLC_BURST_EDGES) return 2;
+            wlcFloating = false;
+            lastRawWlc = readWlcStatusUncached();
+            Log.i(TAG, "WLC: line settled — pad connected, state " + lastRawWlc);
+            return lastRawWlc;
+        }
+
+        // Steady line: nothing to disambiguate, so skip the burst entirely. This is the
+        // common case on a working pad and costs one read per tick, as before.
+        if (raw == lastRawWlc) return raw;
+        lastRawWlc = raw;
+
+        // The line moved. A guest arriving or leaving and a floating pin look identical
+        // in a single sample, so measure the rate before believing it.
+        wlcFloatCheckedAt = now;
+        int edges = wlcBurstEdges();
+        if (edges >= WLC_BURST_EDGES) {
+            wlcFloating = true;
+            Log.i(TAG, "WLC: " + edges + " edges in " + WLC_BURST_MS + "ms — no pad connected");
+            return 2;
+        }
+        // Settled during the burst, so re-read: the value that triggered this is 800 ms old.
+        lastRawWlc = readWlcStatusUncached();
+        return lastRawWlc;
+    }
+
+    /** Poll the Qi pad's guest-detection GPIO on a short cadence and push telemetry the
+     *  instant it changes, so placing/removing a device on the pad is reflected within
+     *  ~WLC_WATCH_MS instead of waiting out the telemetry cache + next check-in. Each tick
+     *  also refreshes the wlc cache so the HTTP safety-net path sees a fresh value too. */
+    private void startWlcWatcher() {
+        wlcWatcher = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "mdm-wlc-watch");
+            t.setDaemon(true);
+            return t;
+        });
+        wlcWatcher.scheduleWithFixedDelay(() -> {
+            try {
+                int w = classifyWlc(readWlcStatusUncached());
+                synchronized (wlcLock) {
+                    cachedWlcStatus = w;
+                    wlcLastMs = SystemClock.elapsedRealtime();
+                }
+                if (w != lastWatchedWlc) {
+                    boolean first = lastWatchedWlc == Integer.MIN_VALUE;
+                    lastWatchedWlc = w;
+                    if (!first) {
+                        Log.i(TAG, "WLC pad state changed: " + w + " — pushing immediate telemetry");
+                        sendTelemetryOverWs();
+                    }
+                }
+            } catch (Exception e) {
+                Log.e(TAG, "wlc watcher error: " + e.getMessage());
+            }
+        }, WLC_WATCH_MS, WLC_WATCH_MS, TimeUnit.MILLISECONDS);
     }
 
     private double getStorageFreeGb() {
@@ -2078,9 +2141,7 @@ public class MdmService extends Service {
         }
         executor.shutdownNow();
         if (heavyExecutor != null) heavyExecutor.shutdownNow();
-        if (wlcReceiver != null) {
-            try { unregisterReceiver(wlcReceiver); } catch (Exception ignored) {}
-        }
+        if (wlcWatcher != null) wlcWatcher.shutdownNow();
         if (wsClient != null) wsClient.stop();
         if (networkCallback != null) {
             try { connectivityManager.unregisterNetworkCallback(networkCallback); } catch (Exception ignored) {}
