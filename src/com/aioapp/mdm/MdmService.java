@@ -123,6 +123,11 @@ public class MdmService extends Service {
     private static final String EXTRA_WLC_STATE = "state";
     private volatile int lastWatchedWlc = Integer.MIN_VALUE;  // last value the receiver observed
 
+    // Hardware product category (T7 vs Kiosk 18/22/27) + its capabilities, resolved once
+    // in onCreate. Gates which telemetry we sample: a wall-powered kiosk has no battery,
+    // charger, or Qi pad, so those fields are omitted rather than reported as bogus values.
+    private final MdmProduct product = MdmProduct.detect();
+
     // App list delta
     private String lastAppsHash = null;
     private volatile boolean sendFullAppList = false;
@@ -189,6 +194,14 @@ public class MdmService extends Service {
         createNotificationChannel();
         startForeground(NOTIFICATION_ID, buildNotification("MDM service running"));
         ensureDeviceOwner();
+
+        // Product (resolved once at field init) gates the receiver registrations below and
+        // the telemetry collectors via its capabilities.
+        Log.i(TAG, "Device product=" + product.key()
+                + " battery=" + product.hasBattery()
+                + " charging=" + product.hasCharging()
+                + " wlc=" + product.hasWlc());
+
         batteryReceiver = new BroadcastReceiver() {
             @Override public void onReceive(Context context, Intent intent) {
                 cachedBatteryIntent = intent;
@@ -236,23 +249,28 @@ public class MdmService extends Service {
         registerNetworkCallback();
         registerPackageChangeReceiver();
 
-        // Subscribe to the Qi pad's guest-presence broadcast. It's sticky, so registerReceiver()
-        // returns the current state as of now — adopt that seed WITHOUT pushing telemetry, so the
-        // first real transition (not service start) is what triggers a push.
-        wlcReceiver = new BroadcastReceiver() {
-            @Override public void onReceive(Context context, Intent intent) {
-                handleWlcIntent(intent);
+        // Subscribe to the Qi pad's guest-presence broadcast — but only on products that
+        // actually have a wireless-charging pad. On a kiosk there is no WlcService emitting
+        // this protected broadcast, so registering would just idle forever.
+        if (product.hasWlc()) {
+            // It's sticky, so registerReceiver() returns the current state as of now — adopt
+            // that seed WITHOUT pushing telemetry, so the first real transition (not service
+            // start) is what triggers a push.
+            wlcReceiver = new BroadcastReceiver() {
+                @Override public void onReceive(Context context, Intent intent) {
+                    handleWlcIntent(intent);
+                }
+            };
+            Intent stickyWlc = registerReceiver(wlcReceiver,
+                    new IntentFilter(ACTION_WLC_GUEST_STATE_CHANGED));
+            if (stickyWlc != null) {
+                int w = stickyWlc.getIntExtra(EXTRA_WLC_STATE, -1);
+                synchronized (wlcLock) {
+                    cachedWlcStatus = w;
+                    wlcLastMs = SystemClock.elapsedRealtime();
+                }
+                lastWatchedWlc = w;
             }
-        };
-        Intent stickyWlc = registerReceiver(wlcReceiver,
-                new IntentFilter(ACTION_WLC_GUEST_STATE_CHANGED));
-        if (stickyWlc != null) {
-            int w = stickyWlc.getIntExtra(EXTRA_WLC_STATE, -1);
-            synchronized (wlcLock) {
-                cachedWlcStatus = w;
-                wlcLastMs = SystemClock.elapsedRealtime();
-            }
-            lastWatchedWlc = w;
         }
     }
 
@@ -1516,14 +1534,25 @@ public class MdmService extends Service {
         populateWifiInfo(extra);
         extra.put("storage_free_gb", getStorageFreeGb());
         extra.put("uptime_seconds", SystemClock.elapsedRealtime() / 1000);
-        extra.put("wlc_status", getWlcStatus());
+        // Wireless-charging pad reading — only on products that have a pad. Omitted on
+        // kiosks so the server sees "no such hardware", not a stuck -1.
+        if (product.hasWlc()) {
+            extra.put("wlc_status", getWlcStatus());
+        }
         extra.put("ram_usage_mb", getRamUsageMb());
         extra.put("timezone", java.util.TimeZone.getDefault().getID());
-        extra.put("battery_temp_c", extractBatteryTemperature(batteryIntent));
-        extra.put("charging", extractCharging(batteryIntent));
-        // Charger detail for the 5V-charger / slow-charge rules: voltage (mV) + plug type.
-        extra.put("charger_voltage_mv", extractChargerVoltage(batteryIntent));
-        extra.put("charger_type", extractChargerType(batteryIntent));
+        // Battery temperature is only meaningful with a battery.
+        if (product.hasBattery()) {
+            extra.put("battery_temp_c", extractBatteryTemperature(batteryIntent));
+        }
+        // Charging state + charger detail (voltage mV, plug type) — only on products with a
+        // charger input. A wall-powered kiosk has none, so these are omitted rather than
+        // reported as a permanent "not charging".
+        if (product.hasCharging()) {
+            extra.put("charging", extractCharging(batteryIntent));
+            extra.put("charger_voltage_mv", extractChargerVoltage(batteryIntent));
+            extra.put("charger_type", extractChargerType(batteryIntent));
+        }
         // Wi-Fi stability: disconnects observed in the last hour (WifiStateTracker).
         extra.put("wifi_disconnects_1h", getWifiDisconnects1h());
         // System health: reboot reason + per-boot id (changes every reboot → the server
@@ -1556,7 +1585,13 @@ public class MdmService extends Service {
         JSONObject payload = new JSONObject();
         payload.put("serial_number", getDeviceSerial());
         payload.put("build_id", currentBuildId());
-        payload.put("battery_pct", extractBatteryPct(getBatteryIntent()));
+        payload.put("product", product.key());
+        // Battery percent only for products with a battery; a no-battery kiosk omits it
+        // (server keeps its prior value / default rather than storing a bogus reading, and
+        // its check-in validation rejects the -1 "unknown" sentinel anyway).
+        if (product.hasBattery()) {
+            payload.put("battery_pct", extractBatteryPct(getBatteryIntent()));
+        }
         payload.put("extra", buildExtra());
 
         // Send full app list only when packages changed or server explicitly requests it
@@ -1591,6 +1626,7 @@ public class MdmService extends Service {
         JSONObject payload = new JSONObject();
         payload.put("serial_number", getDeviceSerial());
         payload.put("build_id", currentBuildId()); // identity — always present
+        payload.put("product", product.key());     // identity — cheap, lets delta-only devices report it
         JSONObject extra = new JSONObject();
         for (String k : VOLATILE_EXTRA_KEYS) {
             if (curExtra.has(k)) extra.put(k, curExtra.get(k));
@@ -1599,7 +1635,8 @@ public class MdmService extends Service {
             for (String k : GATED_EXTRA_KEYS) {
                 if (!sameAsBaseline(k, curExtra)) extra.put(k, curExtra.get(k));
             }
-            if (lastSentBattery != curBattery) payload.put("battery_pct", curBattery);
+            // Battery only for products that have one (matches the keyframe path).
+            if (product.hasBattery() && lastSentBattery != curBattery) payload.put("battery_pct", curBattery);
         }
         payload.put("extra", extra);
         return payload;
