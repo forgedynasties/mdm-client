@@ -13,10 +13,10 @@ import java.util.Random;
 public class MdmApiService {
     private static final String TAG = "MdmApiService";
     // Keep in sync with DEVICE_API_KEY in server .env
-    private static final String API_KEY = "your-secret-key-here";
+    private static final String API_KEY = "ca1b6b645bb96b0a738ecc1bbd7c03078b29d5257d56755f";
 
-    private static final boolean USE_LOCAL_SERVER = false;
-    private static final String LOCAL_API_BASE_URL = "http://10.32.1.170:8080";
+    private static final boolean USE_LOCAL_SERVER = true;
+    private static final String LOCAL_API_BASE_URL = "http://10.32.1.113:8082";
     private static final String DEFAULT_API_BASE_URL = "https://mdm.dev.aioapp.com";
     // Persistent system property that re-points the fleet at a different server
     // without a system update: setprop persist.sys.mdm.url https://host[:port]
