@@ -245,7 +245,7 @@ public class MdmService extends Service {
             }
         };
         Intent stickyWlc = registerReceiver(wlcReceiver,
-                new IntentFilter(ACTION_WLC_GUEST_STATE_CHANGED));
+                new IntentFilter(ACTION_WLC_GUEST_STATE_CHANGED), Context.RECEIVER_EXPORTED);
         if (stickyWlc != null) {
             int w = stickyWlc.getIntExtra(EXTRA_WLC_STATE, -1);
             synchronized (wlcLock) {
