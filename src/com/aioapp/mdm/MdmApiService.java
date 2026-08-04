@@ -35,13 +35,10 @@ public class MdmApiService {
     public MdmApiService() {}
 
     private static String resolveBaseUrl() {
-        String override = SystemPropertiesProxy.get(URL_OVERRIDE_PROP, "");
-        if (override != null && !override.trim().isEmpty()) {
-            String url = override.trim();
-            Log.i(TAG, "Server URL overridden via " + URL_OVERRIDE_PROP + ": " + url);
-            return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
-        }
-        return USE_LOCAL_SERVER ? LOCAL_API_BASE_URL : DEFAULT_API_BASE_URL;
+        // Forced hardcoded server: the persist.sys.mdm.url override is intentionally
+        // ignored so a stale/leftover prop can never re-point this fleet.
+        Log.i(TAG, "Server URL hardcoded (override ignored): " + LOCAL_API_BASE_URL);
+        return LOCAL_API_BASE_URL;
     }
 
     public String getApiKey() { return API_KEY; }
