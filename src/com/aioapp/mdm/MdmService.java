@@ -1541,8 +1541,10 @@ public class MdmService extends Service {
         }
         extra.put("ram_usage_mb", getRamUsageMb());
         extra.put("timezone", java.util.TimeZone.getDefault().getID());
-        // Battery temperature is only meaningful with a battery.
-        if (product.hasBattery()) {
+        // Temperature rides the battery broadcast (EXTRA_TEMPERATURE) but the sensor is a
+        // board thermal channel present on every product, kiosks included (same wiring as
+        // the T7). So report it whenever we have a reading, regardless of hasBattery().
+        if (batteryIntent != null) {
             extra.put("battery_temp_c", extractBatteryTemperature(batteryIntent));
         }
         // Charging state + charger detail (voltage mV, plug type) — only on products with a
