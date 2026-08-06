@@ -35,9 +35,19 @@ public class MdmApiService {
     public MdmApiService() {}
 
     private static String resolveBaseUrl() {
-        // Forced hardcoded server: the persist.sys.mdm.url override is intentionally
-        // ignored so a stale/leftover prop can never re-point this fleet.
-        Log.i(TAG, "Server URL hardcoded (override ignored): " + LOCAL_API_BASE_URL);
+        // Resolve the server URL from a system property first — set in the device
+        // image's build.prop (PRODUCT_SYSTEM_PROPERTIES) or at runtime via
+        // `setprop persist.sys.mdm.url https://host[:port]`. This mirrors how
+        // MdmProduct.detect() resolves the product from a prop, so the same image
+        // can be pointed at a different server without an OTA. Falls back to
+        // LOCAL_API_BASE_URL when the prop is unset so an un-provisioned test
+        // device still reaches the dev server.
+        String override = SystemPropertiesProxy.get(URL_OVERRIDE_PROP, "").trim();
+        if (!override.isEmpty()) {
+            Log.i(TAG, "Server URL from " + URL_OVERRIDE_PROP + "=" + override);
+            return override;
+        }
+        Log.i(TAG, URL_OVERRIDE_PROP + " unset; falling back to " + LOCAL_API_BASE_URL);
         return LOCAL_API_BASE_URL;
     }
 
