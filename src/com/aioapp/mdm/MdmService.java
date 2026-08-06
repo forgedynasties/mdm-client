@@ -1786,8 +1786,15 @@ public class MdmService extends Service {
             "SYSTEM_TOMBSTONE"
     };
     private static final long CRASH_LOOKBACK_MS = 60 * 60 * 1000L; // last hour
-    private static final int  MAX_TRACE_BYTES = 64 * 1024;   // full trace body per crash
-    private static final int  MAX_TOTAL_TRACE_BYTES = 256 * 1024; // budget across one check-in
+    // Bounds on the crash_events field. crash_events is only ONE part of `extra` (wifi,
+    // storage, ram, boot ids, etc. stack on top), and the server rejects an oversized
+    // `extra` outright (413 / dropped WS frame). A crash-heavy device (e.g. full GMS) used
+    // to blow the whole check-in past the limit. Keep the trace budget well under any sane
+    // server cap so the total `extra` stays small, and bound the entry count so a device
+    // with hundreds of crashes can't balloon the array with summary-only objects.
+    private static final int  MAX_TRACE_BYTES = 48 * 1024;   // full trace body per crash
+    private static final int  MAX_TOTAL_TRACE_BYTES = 128 * 1024; // trace budget across one check-in
+    private static final int  MAX_CRASH_ENTRIES = 40;        // hard cap on entries per check-in
 
     /** Recent crash/ANR/tombstone entries from DropBoxManager (readable to this system-UID
      *  app), as [{kind,time_ms,summary,trace}]. The DropBox entry holds the real diagnostic —
@@ -1804,8 +1811,10 @@ public class MdmService extends Service {
             long since = System.currentTimeMillis() - CRASH_LOOKBACK_MS;
             int traceBudget = MAX_TOTAL_TRACE_BYTES;
             for (String tag : CRASH_TAGS) {
+                if (arr.length() >= MAX_CRASH_ENTRIES) break;
                 long cursor = since;
                 for (int i = 0; i < 50; i++) { // bound work per tag
+                    if (arr.length() >= MAX_CRASH_ENTRIES) break;
                     android.os.DropBoxManager.Entry e = dbm.getNextEntry(tag, cursor);
                     if (e == null) break;
                     try {
