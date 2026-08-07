@@ -17,7 +17,7 @@ public class MdmApiService {
 
     private static final boolean USE_LOCAL_SERVER = false;
     private static final String LOCAL_API_BASE_URL = "http://10.32.1.170:8080";
-    private static final String DEFAULT_API_BASE_URL = "https://mdm-stage.dev.aioapp.com";
+    private static final String DEFAULT_API_BASE_URL = "https://mdm.dev.aioapp.com";
     // Persistent system property that re-points the fleet at a different server
     // without a system update: setprop persist.sys.mdm.url https://host[:port]
     private static final String URL_OVERRIDE_PROP = "persist.sys.mdm.url";
