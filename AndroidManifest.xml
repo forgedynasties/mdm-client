@@ -63,11 +63,12 @@
              can surface over it; shown only via KioskExitReceiver on the nav-bar gesture. -->
         <activity
             android:name=".UnlockActivity"
+            android:label="Kiosk"
             android:exported="false"
             android:excludeFromRecents="true"
             android:launchMode="singleTop"
             android:showWhenLocked="true"
-            android:theme="@android:style/Theme.DeviceDefault.Light.Dialog" />
+            android:theme="@android:style/Theme.DeviceDefault.Light.Dialog.NoActionBar" />
 
         <!-- SystemUI (long-press Back in kiosk) broadcasts here; signature-guarded. -->
         <receiver

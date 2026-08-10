@@ -1557,6 +1557,9 @@ public class MdmService extends Service {
         // "exited kiosk offline" event (epoch secs) so the server can audit/alert. The event
         // keeps riding check-ins until the server echoes offline_exit_ack (see applyConfig).
         extra.put("offline_exit_seed_set", KioskExit.seedSet(MdmService.this));
+        // Actual live kiosk state: true once a technician has exited offline (the device is
+        // out of lock-task even though the server's desired config still says kiosk on).
+        extra.put("kiosk_suspended", KioskExit.isSuspended(MdmService.this));
         long offlineExitAt = KioskExit.pendingEventAt(MdmService.this);
         if (offlineExitAt > 0) {
             extra.put("offline_exit_at", offlineExitAt);
