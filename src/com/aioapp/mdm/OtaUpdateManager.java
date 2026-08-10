@@ -159,19 +159,24 @@ public class OtaUpdateManager {
                 downloadFile(url, tempFile, myGen);
                 if (myGen != generation) return;
 
-                // 2. Move to /data/ota_package + set permissions
-                finalizeOtaFile(tempFile);
-                File finalFile = new File(OTA_PACKAGE_PATH);
-                if (!finalFile.exists()) throw new IOException("OTA file missing after move");
-                if (myGen != generation) return;
-
-                // 3. Parse the ZIP to extract payload offset, size, and properties
+                // 2. Parse the app-owned cache copy FIRST. ZipFile mmaps the file to read
+                // its central directory; the app can mmap files in its own cacheDir, but NOT
+                // a file under /data/ota_package (labeled ota_package_file — update_engine's
+                // domain), so parsing after the move fails with EACCES ("Permission denied")
+                // on mmap. The payload offset/size/props are identical regardless of where
+                // the zip lives, so parse here and reuse them for the moved file.
                 currentPhase = "parsing";
-                UpdateParser.ParsedUpdate parsed = UpdateParser.parse(finalFile);
+                UpdateParser.ParsedUpdate parsed = UpdateParser.parse(tempFile);
                 if (parsed == null || !parsed.isValid()) {
                     throw new IOException("Failed to parse OTA ZIP: " + parsed);
                 }
                 Log.i(TAG, "Parsed OTA: " + parsed);
+                if (myGen != generation) return;
+
+                // 3. Move to /data/ota_package + set permissions (where update_engine reads it).
+                finalizeOtaFile(tempFile);
+                File finalFile = new File(OTA_PACKAGE_PATH);
+                if (!finalFile.exists()) throw new IOException("OTA file missing after move");
                 if (myGen != generation) return;
 
                 // 4. Notify download complete
@@ -179,9 +184,10 @@ public class OtaUpdateManager {
 
                 handedOff = true;
 
-                // 5. Hand off to UpdateEngine with parsed values
+                // 5. Hand off to UpdateEngine using the /data/ota_package path (NOT the parsed
+                // temp path) with the offset/size/props from the parse above.
                 applyViaUpdateEngine(
-                        parsed.mUrl, parsed.mOffset, parsed.mSize, parsed.mProps, myGen);
+                        "file://" + OTA_PACKAGE_PATH, parsed.mOffset, parsed.mSize, parsed.mProps, myGen);
 
             } catch (Exception e) {
                 if (myGen == generation) {

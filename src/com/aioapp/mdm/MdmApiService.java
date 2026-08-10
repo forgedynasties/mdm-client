@@ -12,11 +12,16 @@ import java.util.Random;
 
 public class MdmApiService {
     private static final String TAG = "MdmApiService";
-    // Keep in sync with DEVICE_API_KEY in server .env
-    private static final String API_KEY = "your-secret-key-here";
+    // X-API-Key sent to the server; must equal DEVICE_API_KEY in that server's .env.
+    // Resolved from persist.sys.mdm.api_key first (set per image in build.prop or via
+    // setprop), falling back to this built-in default — same pattern as the URL/product
+    // props. Default matches the live server's DEVICE_API_KEY so an un-provisioned image
+    // still authenticates against the live fleet.
+    private static final String DEFAULT_API_KEY = "your-secret-key-here";
+    private static final String API_KEY_OVERRIDE_PROP = "persist.sys.mdm.api_key";
 
     private static final boolean USE_LOCAL_SERVER = false;
-    private static final String LOCAL_API_BASE_URL = "http://10.32.1.170:8080";
+    private static final String LOCAL_API_BASE_URL = "http://10.32.1.113:8082";
     private static final String DEFAULT_API_BASE_URL = "https://mdm.dev.aioapp.com";
     // Persistent system property that re-points the fleet at a different server
     // without a system update: setprop persist.sys.mdm.url https://host[:port]
@@ -26,6 +31,7 @@ public class MdmApiService {
     private static final Random JITTER = new Random();
 
     private volatile String apiBaseUrl = resolveBaseUrl();
+    private volatile String apiKey = resolveApiKey();
     // Written on the executor thread (applyConfig / checkin), read on the alarm thread.
     private volatile long pollIntervalMs = DEFAULT_POLL_INTERVAL_MS;
     private volatile int consecutiveFailures = 0;
@@ -35,16 +41,36 @@ public class MdmApiService {
     public MdmApiService() {}
 
     private static String resolveBaseUrl() {
-        String override = SystemPropertiesProxy.get(URL_OVERRIDE_PROP, "");
-        if (override != null && !override.trim().isEmpty()) {
-            String url = override.trim();
-            Log.i(TAG, "Server URL overridden via " + URL_OVERRIDE_PROP + ": " + url);
-            return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
+        // Resolve the server URL from a system property first — set in the device
+        // image's build.prop (PRODUCT_SYSTEM_PROPERTIES) or at runtime via
+        // `setprop persist.sys.mdm.url https://host[:port]`. This mirrors how
+        // MdmProduct.detect() resolves the product from a prop, so the same image
+        // can be pointed at a different server without an OTA. When the prop is
+        // unset, fall back to the production server (DEFAULT_API_BASE_URL) unless
+        // USE_LOCAL_SERVER is flipped on for local testing.
+        String override = SystemPropertiesProxy.get(URL_OVERRIDE_PROP, "").trim();
+        if (!override.isEmpty()) {
+            Log.i(TAG, "Server URL from " + URL_OVERRIDE_PROP + "=" + override);
+            return override;
         }
-        return USE_LOCAL_SERVER ? LOCAL_API_BASE_URL : DEFAULT_API_BASE_URL;
+        String fallback = USE_LOCAL_SERVER ? LOCAL_API_BASE_URL : DEFAULT_API_BASE_URL;
+        Log.i(TAG, URL_OVERRIDE_PROP + " unset; falling back to " + fallback);
+        return fallback;
     }
 
-    public String getApiKey() { return API_KEY; }
+    private static String resolveApiKey() {
+        // Prop first (per-image build.prop or runtime setprop), else the built-in
+        // default. Never log the key value.
+        String override = SystemPropertiesProxy.get(API_KEY_OVERRIDE_PROP, "").trim();
+        if (!override.isEmpty()) {
+            Log.i(TAG, "API key from " + API_KEY_OVERRIDE_PROP);
+            return override;
+        }
+        Log.i(TAG, API_KEY_OVERRIDE_PROP + " unset; using built-in default");
+        return DEFAULT_API_KEY;
+    }
+
+    public String getApiKey() { return apiKey; }
 
     public String getApiBaseUrl() { return apiBaseUrl; }
 
@@ -69,6 +95,7 @@ public class MdmApiService {
         // Re-read the persistent property so a setprop takes effect at the next
         // sync without restarting the service.
         apiBaseUrl = resolveBaseUrl();
+        apiKey = resolveApiKey();
     }
 
     /**
@@ -216,7 +243,7 @@ public class MdmApiService {
         HttpURLConnection conn = (HttpURLConnection) url.openConnection();
         conn.setRequestMethod("POST");
         conn.setRequestProperty("Content-Type", "application/json; charset=UTF-8");
-        conn.setRequestProperty("X-API-Key", API_KEY);
+        conn.setRequestProperty("X-API-Key", apiKey);
         conn.setDoOutput(true);
         conn.setConnectTimeout(10_000);
         conn.setReadTimeout(30_000);
