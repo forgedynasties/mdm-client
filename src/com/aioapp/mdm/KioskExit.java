@@ -40,25 +40,25 @@ public final class KioskExit {
         return de.getSharedPreferences(PREFS, Context.MODE_PRIVATE);
     }
 
-    /** Ingest the server's offline_exit config block (from the check-in config). */
+    /**
+     * Ingest the server's offline_exit config block. Offline exit is part of kiosk (not a
+     * separate opt-in): the block just carries the unlock seed + code parameters. The seed
+     * is stored the first time we see it and kept on later pushes.
+     */
     public static void savePolicy(Context ctx, JSONObject offline) {
         if (offline == null) return;
         SharedPreferences.Editor e = prefs(ctx).edit();
-        e.putBoolean(K_ENABLED, offline.optBoolean("enabled", false));
         e.putInt(K_DIGITS, offline.optInt("digits", 6));
-        e.putInt(K_PERIOD, offline.optInt("period", 30));
-        e.putString(K_RELOCK, offline.optString("relock", "reboot"));
-        // The seed is sent only until the device acknowledges it; store it the first
-        // time we see it and never clear it on subsequent (seed-less) pushes.
+        e.putInt(K_PERIOD, offline.optInt("period", 60));
         String seed = offline.optString("seed", "");
         if (!seed.isEmpty()) e.putString(K_SEED, seed);
         e.apply();
-        Log.i(TAG, "offline-exit policy: enabled=" + offline.optBoolean("enabled", false)
-                + " seedSet=" + seedSet(ctx));
+        Log.i(TAG, "offline-exit seed provisioned=" + seedSet(ctx));
     }
 
+    /** Offline exit is usable once a seed is provisioned (only reachable while in kiosk). */
     public static boolean isEnabled(Context ctx) {
-        return prefs(ctx).getBoolean(K_ENABLED, false) && seedSet(ctx);
+        return seedSet(ctx);
     }
 
     public static boolean seedSet(Context ctx) {
@@ -67,11 +67,9 @@ public final class KioskExit {
 
     private static String seed(Context ctx)   { return prefs(ctx).getString(K_SEED, ""); }
     private static int digits(Context ctx)    { return prefs(ctx).getInt(K_DIGITS, 6); }
-    private static int period(Context ctx)    { return prefs(ctx).getInt(K_PERIOD, 30); }
+    private static int period(Context ctx)    { return prefs(ctx).getInt(K_PERIOD, 60); }
 
-    public static String relock(Context ctx)  { return prefs(ctx).getString(K_RELOCK, "reboot"); }
-
-    // ── suspend flag (local exit active) ──
+    // ── exited guard (device left kiosk locally; survives reboot until the server acks) ──
     public static boolean isSuspended(Context ctx) { return prefs(ctx).getBoolean(K_SUSPENDED, false); }
     public static void setSuspended(Context ctx, boolean v) { prefs(ctx).edit().putBoolean(K_SUSPENDED, v).apply(); }
 

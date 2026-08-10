@@ -696,10 +696,13 @@ public class MdmService extends Service {
         // store it before applying kiosk policy so a suspended device is respected.
         try {
             KioskExit.savePolicy(MdmService.this, config.optJSONObject("offline_exit"));
-            // Server acknowledged our reported exit event → stop resending it.
+            // Server acknowledged our reported exit → it has flipped kiosk off on its side.
+            // Stop resending and drop the local "exited" guard; the config in this same
+            // response now says kiosk-off, so the device settles cleanly.
             long ack = config.optLong("offline_exit_ack", 0);
             if (ack > 0 && ack == KioskExit.pendingEventAt(MdmService.this)) {
                 KioskExit.clearPendingEvent(MdmService.this);
+                KioskExit.setSuspended(MdmService.this, false);
             }
         } catch (Exception e) {
             Log.e(TAG, "offline-exit savePolicy error: " + e.getMessage());
