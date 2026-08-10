@@ -30,6 +30,11 @@ public class BootReceiver extends BroadcastReceiver {
             // loadConfig now reads device-protected storage, but keep the whole block guarded so
             // any failure here can never abort the boot handler (which also starts the service).
             try {
+                // Reboot re-locks: a local offline-exit suspension does not survive a reboot,
+                // so clear it before re-applying the saved kiosk config (relock policy "reboot").
+                if ("reboot".equals(KioskExit.relock(context))) {
+                    KioskExit.setSuspended(context, false);
+                }
                 JSONObject savedConfig = KioskManager.loadConfig(context);
                 if (savedConfig != null) {
                     DevicePolicyManager dpm = (DevicePolicyManager)

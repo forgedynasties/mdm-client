@@ -692,6 +692,18 @@ public class MdmService extends Service {
                 scheduleNextPoll(); // re-arm the alarm immediately at the new cadence
             }
         }
+        // Offline kiosk-exit policy (TOTP seed + settings) is provisioned via config;
+        // store it before applying kiosk policy so a suspended device is respected.
+        try {
+            KioskExit.savePolicy(MdmService.this, config.optJSONObject("offline_exit"));
+            // Server acknowledged our reported exit event → stop resending it.
+            long ack = config.optLong("offline_exit_ack", 0);
+            if (ack > 0 && ack == KioskExit.pendingEventAt(MdmService.this)) {
+                KioskExit.clearPendingEvent(MdmService.this);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "offline-exit savePolicy error: " + e.getMessage());
+        }
         try {
             KioskManager.applyAndSave(MdmService.this, dpm, adminComponent, config);
         } catch (Exception e) {
@@ -1541,6 +1553,14 @@ public class MdmService extends Service {
         }
         extra.put("ram_usage_mb", getRamUsageMb());
         extra.put("timezone", java.util.TimeZone.getDefault().getID());
+        // Offline kiosk-exit: ack that the TOTP seed is provisioned, and surface a pending
+        // "exited kiosk offline" event (epoch secs) so the server can audit/alert. The event
+        // keeps riding check-ins until the server echoes offline_exit_ack (see applyConfig).
+        extra.put("offline_exit_seed_set", KioskExit.seedSet(MdmService.this));
+        long offlineExitAt = KioskExit.pendingEventAt(MdmService.this);
+        if (offlineExitAt > 0) {
+            extra.put("offline_exit_at", offlineExitAt);
+        }
         // Temperature rides the battery broadcast (EXTRA_TEMPERATURE) but the sensor is a
         // board thermal channel present on every product, kiosks included (same wiring as
         // the T7). So report it whenever we have a reading, regardless of hasBattery().

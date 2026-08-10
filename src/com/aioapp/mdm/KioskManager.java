@@ -30,6 +30,15 @@ public class KioskManager {
             String pkg = config.optString("kiosk_package", "");
 
             if (enabled && !pkg.isEmpty()) {
+                // A technician exited kiosk offline (TOTP): honour that local suspension and do
+                // NOT re-lock, even though the server config still says kiosk_enabled. The flag is
+                // cleared on reboot (BootReceiver) — reboot re-locks — or when the server pushes
+                // kiosk_enabled=false (the else branch below), so an admin can re-lock via toggle.
+                if (KioskExit.isSuspended(ctx)) {
+                    Log.i(TAG, "Kiosk suspended by offline exit — not re-locking");
+                    return;
+                }
+
                 // Verify the package is installed and launchable BEFORE imposing lock-task.
                 // Previously the policy was set (and home/status bar hidden) first, then the
                 // launch intent checked — so a missing/typo'd/uninstalled kiosk package trapped
@@ -44,8 +53,9 @@ public class KioskManager {
                     return;
                 }
 
-                // 1. Whitelist the package for lock task mode
-                dpm.setLockTaskPackages(admin, new String[]{pkg});
+                // 1. Whitelist the kiosk package AND mdm-client itself, so the offline-exit
+                //    UnlockActivity can surface over the locked kiosk app.
+                dpm.setLockTaskPackages(admin, new String[]{pkg, ctx.getPackageName()});
 
                 // 2. LOCK_TASK_FEATURE_NONE hides home, overview, notifications,
                 //    status bar, and global actions. The back button ALWAYS remains
@@ -71,11 +81,38 @@ public class KioskManager {
                 dpm.setLockTaskPackages(admin, new String[]{});
                 Settings.Global.putString(ctx.getContentResolver(),
                         Settings.Global.POLICY_CONTROL, "");
+                // Server disabled kiosk — clear any local offline-exit suspension so a later
+                // re-enable (or a reboot) locks cleanly from a known state.
+                KioskExit.setSuspended(ctx, false);
                 Log.i(TAG, "Kiosk disabled");
             }
         } catch (Exception e) {
             Log.e(TAG, "apply error: " + e.getMessage());
         }
+    }
+
+    /**
+     * Leave lock-task locally after a verified offline exit. The saved kiosk config is left
+     * intact (still enabled); a local suspension flag prevents re-lock until reboot or a
+     * server kiosk toggle. Sends the user to the launcher so the device isn't stuck on the
+     * now-unlocked kiosk app.
+     */
+    public static void suspendLocally(Context ctx, DevicePolicyManager dpm, ComponentName admin) {
+        stopSystemLockTask();
+        try {
+            dpm.setLockTaskPackages(admin, new String[]{});
+        } catch (Exception e) {
+            Log.e(TAG, "suspendLocally clear packages error: " + e.getMessage());
+        }
+        KioskExit.markExited(ctx);
+        try {
+            Intent home = new Intent(Intent.ACTION_MAIN);
+            home.addCategory(Intent.CATEGORY_HOME);
+            home.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(home);
+        } catch (Exception ignored) {
+        }
+        Log.i(TAG, "Kiosk suspended locally (offline exit)");
     }
 
     private static void stopSystemLockTask() {

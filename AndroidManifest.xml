@@ -21,6 +21,12 @@
     <uses-permission android:name="android.permission.WRITE_SECURE_SETTINGS" />
     <uses-permission android:name="android.permission.INJECT_EVENTS" />
 
+    <!-- Only platform-signed components (SystemUI) may trigger the offline kiosk-exit prompt. -->
+    <permission
+        android:name="com.aioapp.mdm.permission.KIOSK_EXIT"
+        android:protectionLevel="signature" />
+    <uses-permission android:name="com.aioapp.mdm.permission.KIOSK_EXIT" />
+
     <application
         android:allowBackup="false"
         android:label="@string/app_name"
@@ -52,6 +58,26 @@
             android:name=".MdmService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- Offline kiosk-exit prompt. Whitelisted for lock-task alongside the kiosk app so it
+             can surface over it; shown only via KioskExitReceiver on the nav-bar gesture. -->
+        <activity
+            android:name=".UnlockActivity"
+            android:exported="false"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:showWhenLocked="true"
+            android:theme="@android:style/Theme.DeviceDefault.Light.Dialog" />
+
+        <!-- SystemUI (long-press Back in kiosk) broadcasts here; signature-guarded. -->
+        <receiver
+            android:name=".KioskExitReceiver"
+            android:exported="true"
+            android:permission="com.aioapp.mdm.permission.KIOSK_EXIT">
+            <intent-filter>
+                <action android:name="com.aioapp.mdm.action.KIOSK_EXIT_PROMPT" />
+            </intent-filter>
+        </receiver>
 
     </application>
 </manifest>
