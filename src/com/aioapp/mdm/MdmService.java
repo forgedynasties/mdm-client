@@ -398,7 +398,10 @@ public class MdmService extends Service {
                     JSONObject response = apiService.checkin(payload);
                     if (response != null) {
                         // Keyframe landed — reset the delta baseline to this full snapshot.
-                        rememberSent(payload.getJSONObject("extra"), payload.getInt("battery_pct"));
+                        // Battery-less products (kiosks) omit battery_pct from the payload — use
+                        // optInt(-1) to match extractBatteryPct's no-battery value and avoid a
+                        // JSONException ("No value for battery_pct") after an otherwise-OK check-in.
+                        rememberSent(payload.getJSONObject("extra"), payload.optInt("battery_pct", -1));
                         if (response.optBoolean("send_apps", false)) sendFullAppList = true;
                         JSONObject config = response.optJSONObject("config");
                         if (config != null) applyConfig(config);
@@ -668,7 +671,10 @@ public class MdmService extends Service {
                     JSONObject payload = buildCheckinPayload();
                     JSONObject response = apiService.checkin(payload);
                     if (response != null) {
-                        rememberSent(payload.getJSONObject("extra"), payload.getInt("battery_pct"));
+                        // Battery-less products (kiosks) omit battery_pct from the payload — use
+                        // optInt(-1) to match extractBatteryPct's no-battery value and avoid a
+                        // JSONException ("No value for battery_pct") after an otherwise-OK check-in.
+                        rememberSent(payload.getJSONObject("extra"), payload.optInt("battery_pct", -1));
                         JSONObject config = response.optJSONObject("config");
                         if (config != null) applyConfig(config);
                     }
