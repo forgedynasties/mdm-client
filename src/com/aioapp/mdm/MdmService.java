@@ -48,6 +48,14 @@ public class MdmService extends Service {
     private static final String LOCATION_TAG = "MdmLocation";
     private static final String CHANNEL_ID = "MDM_SERVICE";
     private static final int NOTIFICATION_ID = 1001;
+
+    // Kiosk-exit gesture: SystemUI's long-press-Back arms an exit (via KioskExitReceiver
+    // -> this action); the technician confirms by pressing Power (screen-off) within the
+    // window below. Retires the TOTP prompt without removing the code from the tree.
+    public static final String ACTION_KIOSK_EXIT_ARM = "com.aioapp.mdm.action.KIOSK_EXIT_ARM";
+    private static final long KIOSK_EXIT_ARM_WINDOW_MS = 4000;
+    private volatile long kioskExitArmedUntilMs = 0;
+    private BroadcastReceiver screenOffReceiver;
     // Separate notification for app download/install progress, so it doesn't disturb the
     // persistent foreground-service notification (1001).
     private static final int INSTALL_NOTIFICATION_ID = 1002;
@@ -262,6 +270,19 @@ public class MdmService extends Service {
         };
         registerReceiver(wifiReceiver, new IntentFilter(WifiManager.NETWORK_STATE_CHANGED_ACTION));
 
+        // Kiosk-exit confirm: a Power press turns the screen off. When an exit was armed
+        // (long-press Back) within the last KIOSK_EXIT_ARM_WINDOW_MS, that Power press is
+        // the confirmation — leave kiosk. Outside the armed window this is a no-op.
+        screenOffReceiver = new BroadcastReceiver() {
+            @Override public void onReceive(Context context, Intent intent) {
+                if (!Intent.ACTION_SCREEN_OFF.equals(intent.getAction())) return;
+                if (SystemClock.elapsedRealtime() > kioskExitArmedUntilMs) return;
+                kioskExitArmedUntilMs = 0;
+                performGestureKioskExit();
+            }
+        };
+        registerReceiver(screenOffReceiver, new IntentFilter(Intent.ACTION_SCREEN_OFF));
+
         alarmManager = getSystemService(AlarmManager.class);
         pollReceiver = new BroadcastReceiver() {
             @Override public void onReceive(Context context, Intent intent) {
@@ -284,12 +305,51 @@ public class MdmService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        // Kiosk-exit arm request from the long-press-Back gesture (KioskExitReceiver).
+        if (intent != null && ACTION_KIOSK_EXIT_ARM.equals(intent.getAction())) {
+            armKioskExit();
+            return START_STICKY;
+        }
         // Cancel any existing alarm before rescheduling — prevents duplicates when
         // LOCKED_BOOT_COMPLETED + BOOT_COMPLETED both fire on a fresh boot.
         alarmManager.cancel(pollIntent);
         if (networkAvailable && !polling) performCheckin();
         scheduleNextPoll();
         return START_STICKY;
+    }
+
+    /** True when the device is currently in lock-task (kiosk) mode. */
+    private boolean isInKioskLock() {
+        try {
+            ActivityManager am = (ActivityManager) getSystemService(Context.ACTIVITY_SERVICE);
+            return am != null && am.getLockTaskModeState() != ActivityManager.LOCK_TASK_MODE_NONE;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Arm a kiosk exit (long-press Back). Only while actually in kiosk; the technician
+     *  then presses Power within KIOSK_EXIT_ARM_WINDOW_MS to confirm. */
+    private void armKioskExit() {
+        if (!isInKioskLock()) {
+            Log.d(TAG, "kiosk-exit arm ignored: not in kiosk lock");
+            return;
+        }
+        kioskExitArmedUntilMs = SystemClock.elapsedRealtime() + KIOSK_EXIT_ARM_WINDOW_MS;
+        Log.i(TAG, "kiosk-exit armed for " + KIOSK_EXIT_ARM_WINDOW_MS + "ms — press Power to exit");
+    }
+
+    /** Confirmed exit (armed Back + Power). Leaves kiosk locally and reports it on the
+     *  next check-in; a check-in is kicked off immediately so the server reflects it fast. */
+    private void performGestureKioskExit() {
+        try {
+            if (!isInKioskLock()) return;
+            KioskManager.suspendLocally(this, dpm, adminComponent);
+            Log.i(TAG, "kiosk exited via Back+Power gesture");
+            if (networkAvailable && !polling) performCheckin();
+        } catch (Exception e) {
+            Log.e(TAG, "gesture kiosk exit failed: " + e.getMessage());
+        }
     }
 
     /** True when the device is on external power (wired or wireless pad). */
@@ -2320,6 +2380,9 @@ public class MdmService extends Service {
         }
         if (wifiReceiver != null) {
             try { unregisterReceiver(wifiReceiver); } catch (Exception ignored) {}
+        }
+        if (screenOffReceiver != null) {
+            try { unregisterReceiver(screenOffReceiver); } catch (Exception ignored) {}
         }
         super.onDestroy();
     }
