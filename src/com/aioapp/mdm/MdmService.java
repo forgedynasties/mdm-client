@@ -345,7 +345,13 @@ public class MdmService extends Service {
         try {
             if (!isInKioskLock()) return;
             KioskManager.suspendLocally(this, dpm, adminComponent);
-            Log.i(TAG, "kiosk exited via Back+Power gesture");
+            Log.i(TAG, "kiosk exited via Back+Power gesture — pushing immediate telemetry");
+            // Report the exit AT ONCE so the dashboard flips immediately (like the charging
+            // chip), not on the next scheduled poll. Force a keyframe so the frame carrying
+            // offline_exit_at isn't dropped by the delta-skip; push over WS if connected,
+            // and fall back to an HTTP check-in otherwise.
+            forceKeyframe = true;
+            sendTelemetryOverWs();
             if (networkAvailable && !polling) performCheckin();
         } catch (Exception e) {
             Log.e(TAG, "gesture kiosk exit failed: " + e.getMessage());
