@@ -2,4 +2,5 @@
 <config>
     <allow-in-power-save package="com.aioapp.mdm" />
     <allow-in-data-usage-save package="com.aioapp.mdm" />
+    <allow-unthrottled-location package="com.aioapp.mdm" />
 </config>
