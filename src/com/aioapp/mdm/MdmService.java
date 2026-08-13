@@ -1234,6 +1234,23 @@ public class MdmService extends Service {
             // Baseline profile matches the browser's avc1.42E01E decoder config.
             fmt.setInteger(android.media.MediaFormat.KEY_PROFILE,
                     android.media.MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline);
+            // Low-latency tuning — minimise tap-to-screen delay for remote control:
+            //  - realtime priority so the encoder is scheduled ahead of background work;
+            //  - CBR so a static screen doesn't build a VBR buffer that delays motion;
+            //  - no B-frames (baseline has none, but be explicit) so no reorder delay;
+            //  - encode latency of 1 frame so the encoder never holds a frame back;
+            //  - cap the input rate to the target fps (fixed fps) so we don't burn CPU
+            //    encoding redundant frames on a busy screen;
+            //  - repeat the last frame after one frame-interval so the stream keeps a
+            //    steady cadence and the decoder always holds the freshest content even
+            //    when the screen is idle. Unsupported keys are ignored by the encoder.
+            fmt.setInteger(android.media.MediaFormat.KEY_BITRATE_MODE,
+                    android.media.MediaCodecInfo.EncoderCapabilities.BITRATE_MODE_CBR);
+            fmt.setInteger(android.media.MediaFormat.KEY_PRIORITY, 0); // 0 = realtime
+            fmt.setInteger(android.media.MediaFormat.KEY_MAX_B_FRAMES, 0);
+            fmt.setInteger(android.media.MediaFormat.KEY_LATENCY, 1);
+            fmt.setFloat(android.media.MediaFormat.KEY_MAX_FPS_TO_ENCODER, (float) fps);
+            fmt.setLong(android.media.MediaFormat.KEY_REPEAT_PREVIOUS_FRAME_AFTER, 1000000L / fps);
             mc = android.media.MediaCodec.createEncoderByType("video/avc");
             mc.configure(fmt, null, null, android.media.MediaCodec.CONFIGURE_FLAG_ENCODE);
             surface = mc.createInputSurface();
