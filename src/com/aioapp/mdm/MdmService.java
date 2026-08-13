@@ -1149,7 +1149,13 @@ public class MdmService extends Service {
             try {
                 while (isCapturing || !sendQ.isEmpty()) {
                     byte[] f = sendQ.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS);
-                    if (f != null && wsClient != null && wsClient.isConnected()) wsClient.sendBinary(f);
+                    if (f != null && wsClient != null && wsClient.isConnected()) {
+                        try {
+                            wsClient.sendBinary(f);
+                        } catch (java.io.IOException io) {
+                            Log.w(TAG, "Frame send failed: " + io.getMessage());
+                        }
+                    }
                 }
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
@@ -1246,7 +1252,13 @@ public class MdmService extends Service {
                 try {
                     while (isCapturing || !sendQ.isEmpty()) {
                         byte[] f = sendQ.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS);
-                        if (f != null && wsClient != null && wsClient.isConnected()) wsClient.sendBinary(f);
+                        if (f != null && wsClient != null && wsClient.isConnected()) {
+                            try {
+                                wsClient.sendBinary(f);
+                            } catch (java.io.IOException io) {
+                                Log.w(TAG, "Frame send failed: " + io.getMessage());
+                            }
+                        }
                     }
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
