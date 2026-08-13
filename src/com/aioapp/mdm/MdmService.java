@@ -855,13 +855,15 @@ public class MdmService extends Service {
                 heavyExecutor.submit(() -> {
                     // Clamp server-supplied capture params so an out-of-range value can't peg CPU
                     // or flood the WS (a bad/hostile server shouldn't be able to melt the device).
+                    String codec = "h264".equals(msg.optString("codec", "jpeg")) ? "h264" : "jpeg";
                     int quality = Math.max(1, Math.min(100, msg.optInt("quality", 60)));
                     double scale = Math.max(0.1, Math.min(1.0, msg.optDouble("scale", 0.5)));
                     int maxFps = Math.max(1, Math.min(30, msg.optInt("max_fps", 10)));
+                    int bitrate = Math.max(250000, Math.min(20000000, msg.optInt("bitrate", 4000000)));
                     if (!isCapturing) {
                         isCapturing = true;
                         acquireRemoteWakeLock();
-                        runCaptureLoop(quality, scale, maxFps);
+                        runCaptureLoop(codec, quality, scale, maxFps, bitrate);
                     }
                 });
                 break;
@@ -1065,13 +1067,15 @@ public class MdmService extends Service {
             }
             case "start_capture": {
                 // Clamp server-supplied capture params (see the WS start_capture handler).
+                String codec = "h264".equals(payload.optString("codec", "jpeg")) ? "h264" : "jpeg";
                 int quality = Math.max(1, Math.min(100, payload.optInt("quality", 60)));
                 double scale = Math.max(0.1, Math.min(1.0, payload.optDouble("scale", 0.5)));
                 int maxFps = Math.max(1, Math.min(30, payload.optInt("max_fps", 10)));
+                int bitrate = Math.max(250000, Math.min(20000000, payload.optInt("bitrate", 4000000)));
                 if (!isCapturing) {
                     isCapturing = true;
                     acquireRemoteWakeLock();
-                    heavyExecutor.submit(() -> runCaptureLoop(quality, scale, maxFps));
+                    heavyExecutor.submit(() -> runCaptureLoop(codec, quality, scale, maxFps, bitrate));
                 }
                 ackCommand(cmdId, serialNumber, "completed", "");
                 break;
@@ -1089,7 +1093,7 @@ public class MdmService extends Service {
     }
 
 
-    private void runCaptureLoop(int quality, double scale, int maxFps) {
+    private void runCaptureLoop(String codec, int quality, double scale, int maxFps, int bitrate) {
         // getDisplay() throws/returns null on a Service context on some Android
         // versions; fall back to the DisplayManager's default display.
         android.view.Display display = null;
@@ -1118,9 +1122,40 @@ public class MdmService extends Service {
         int scaledH = (int) (size.y * scale);
         int rotation = display.getRotation();
 
+        // Tier 3: hardware H.264 when the operator opted in (?codec=h264). Runs until the
+        // session stops; falls back to the JPEG still path if the encoder or auto-mirror
+        // display can't be set up on this device.
+        if ("h264".equals(codec)) {
+            boolean ran = runH264Loop(scaledW, scaledH, maxFps, bitrate);
+            if (ran) {
+                isCapturing = false;
+                releaseRemoteWakeLock();
+                Log.i(TAG, "Capture loop stopped");
+                return;
+            }
+            Log.w(TAG, "H.264 unavailable — falling back to JPEG stills");
+        }
+
         long targetMs = 1000 / maxFps;
         Log.i(TAG, "Capture loop started — scaled=" + scaledW + "x" + scaledH
-                + " quality=" + quality + " fps=" + maxFps);
+                + " quality=" + quality + " fps=" + maxFps + " codec=jpeg");
+
+        // Decouple the blocking WS send from capture+encode: a dedicated sender drains this
+        // queue so the next frame is captured while the previous one uploads. Bounded and
+        // drop-oldest so a slow link sheds frames instead of piling up latency.
+        final java.util.concurrent.ArrayBlockingQueue<byte[]> sendQ =
+                new java.util.concurrent.ArrayBlockingQueue<>(2);
+        Thread sender = new Thread(() -> {
+            try {
+                while (isCapturing || !sendQ.isEmpty()) {
+                    byte[] f = sendQ.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    if (f != null && wsClient != null && wsClient.isConnected()) wsClient.sendBinary(f);
+                }
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+        }, "mdm-frame-sender");
+        sender.start();
 
         long sent = 0, nullFrames = 0, lastLog = System.currentTimeMillis();
         while (isCapturing && wsClient != null && wsClient.isConnected()) {
@@ -1137,11 +1172,13 @@ public class MdmService extends Service {
                     continue;
                 }
                 java.io.ByteArrayOutputStream bos = new java.io.ByteArrayOutputStream(32768);
-                screen.compress(android.graphics.Bitmap.CompressFormat.WEBP, quality, bos);
+                // JPEG software-encodes several times faster than WEBP at similar size/quality —
+                // the main lever moving the still path from ~3 fps toward the target.
+                screen.compress(android.graphics.Bitmap.CompressFormat.JPEG, quality, bos);
                 screen.recycle();
 
                 byte[] frame = bos.toByteArray();
-                wsClient.sendBinary(frame);
+                if (!sendQ.offer(frame)) { sendQ.poll(); sendQ.offer(frame); } // drop oldest under back-pressure
                 sent++;
                 if (start - lastLog >= 5000) {
                     Log.i(TAG, "Capture: " + sent + " frames sent in last 5s (" + frame.length + "B last)");
@@ -1159,8 +1196,121 @@ public class MdmService extends Service {
             }
         }
         isCapturing = false;
+        sender.interrupt();
         releaseRemoteWakeLock();
         Log.i(TAG, "Capture loop stopped");
+    }
+
+    /**
+     * Tier 3 hardware path: mirror the screen into a MediaCodec H.264 encoder via an
+     * auto-mirror VirtualDisplay and stream Annex-B NAL units. Each WS message is
+     * [1-byte type][payload]: type 1 = key frame (SPS/PPS prepended), 0 = delta — the
+     * browser decodes this with WebCodecs. Returns true if it ran (setup succeeded),
+     * false if the encoder/display couldn't be set up so the caller can fall back to
+     * JPEG stills. Blocks until the session stops. Needs CAPTURE_VIDEO_OUTPUT (held as
+     * a privileged platform app).
+     */
+    private boolean runH264Loop(int w, int h, int fps, int bitrate) {
+        w = w & ~1; h = h & ~1; // H.264 wants even dimensions
+        android.media.MediaCodec mc = null;
+        android.hardware.display.VirtualDisplay vd = null;
+        android.view.Surface surface = null;
+        Thread sender = null;
+        final java.util.concurrent.ArrayBlockingQueue<byte[]> sendQ =
+                new java.util.concurrent.ArrayBlockingQueue<>(3);
+        try {
+            android.media.MediaFormat fmt = android.media.MediaFormat.createVideoFormat("video/avc", w, h);
+            fmt.setInteger(android.media.MediaFormat.KEY_COLOR_FORMAT,
+                    android.media.MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface);
+            fmt.setInteger(android.media.MediaFormat.KEY_BIT_RATE, bitrate);
+            fmt.setInteger(android.media.MediaFormat.KEY_FRAME_RATE, fps);
+            fmt.setInteger(android.media.MediaFormat.KEY_I_FRAME_INTERVAL, 1); // 1s key frames
+            // Baseline profile matches the browser's avc1.42E01E decoder config.
+            fmt.setInteger(android.media.MediaFormat.KEY_PROFILE,
+                    android.media.MediaCodecInfo.CodecProfileLevel.AVCProfileBaseline);
+            mc = android.media.MediaCodec.createEncoderByType("video/avc");
+            mc.configure(fmt, null, null, android.media.MediaCodec.CONFIGURE_FLAG_ENCODE);
+            surface = mc.createInputSurface();
+            mc.start();
+
+            android.hardware.display.DisplayManager dm =
+                    (android.hardware.display.DisplayManager) getSystemService(Context.DISPLAY_SERVICE);
+            int dpi = getResources().getDisplayMetrics().densityDpi;
+            int flags = android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR
+                    | android.hardware.display.DisplayManager.VIRTUAL_DISPLAY_FLAG_PUBLIC;
+            vd = dm.createVirtualDisplay("mdm-remote", w, h, dpi, surface, flags);
+            if (vd == null) throw new IllegalStateException("createVirtualDisplay returned null");
+
+            final android.media.MediaCodec fmc = mc;
+            sender = new Thread(() -> {
+                try {
+                    while (isCapturing || !sendQ.isEmpty()) {
+                        byte[] f = sendQ.poll(200, java.util.concurrent.TimeUnit.MILLISECONDS);
+                        if (f != null && wsClient != null && wsClient.isConnected()) wsClient.sendBinary(f);
+                    }
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                }
+            }, "mdm-frame-sender-h264");
+            sender.start();
+
+            Log.i(TAG, "H.264 capture started — " + w + "x" + h + " fps=" + fps + " bitrate=" + bitrate);
+            android.media.MediaCodec.BufferInfo info = new android.media.MediaCodec.BufferInfo();
+            byte[] csd = null; // SPS/PPS, prepended to each key frame
+            long sent = 0, lastLog = System.currentTimeMillis();
+            while (isCapturing && wsClient != null && wsClient.isConnected()) {
+                int idx = mc.dequeueOutputBuffer(info, 100000); // 100ms
+                if (idx == android.media.MediaCodec.INFO_OUTPUT_FORMAT_CHANGED) {
+                    android.media.MediaFormat of = mc.getOutputFormat();
+                    java.nio.ByteBuffer sps = of.getByteBuffer("csd-0");
+                    java.nio.ByteBuffer pps = of.getByteBuffer("csd-1");
+                    if (sps != null && pps != null) {
+                        byte[] s = new byte[sps.remaining()]; sps.get(s);
+                        byte[] p = new byte[pps.remaining()]; pps.get(p);
+                        csd = new byte[s.length + p.length];
+                        System.arraycopy(s, 0, csd, 0, s.length);
+                        System.arraycopy(p, 0, csd, s.length, p.length);
+                    }
+                    continue;
+                }
+                if (idx < 0) continue; // INFO_TRY_AGAIN_LATER etc.
+                java.nio.ByteBuffer buf = mc.getOutputBuffer(idx);
+                if (buf == null) { mc.releaseOutputBuffer(idx, false); continue; }
+                buf.position(info.offset);
+                buf.limit(info.offset + info.size);
+                byte[] data = new byte[info.size];
+                buf.get(data);
+                mc.releaseOutputBuffer(idx, false);
+
+                boolean isConfig = (info.flags & android.media.MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0;
+                boolean isKey = (info.flags & android.media.MediaCodec.BUFFER_FLAG_KEY_FRAME) != 0;
+                if (isConfig) { csd = data; continue; } // SPS/PPS as a config buffer
+                byte[] payload = data;
+                if (isKey && csd != null) {
+                    payload = new byte[csd.length + data.length];
+                    System.arraycopy(csd, 0, payload, 0, csd.length);
+                    System.arraycopy(data, 0, payload, csd.length, data.length);
+                }
+                byte[] framed = new byte[payload.length + 1];
+                framed[0] = (byte) (isKey ? 1 : 0);
+                System.arraycopy(payload, 0, framed, 1, payload.length);
+                if (!sendQ.offer(framed)) { sendQ.poll(); sendQ.offer(framed); } // drop oldest
+                sent++;
+                if (System.currentTimeMillis() - lastLog >= 5000) {
+                    Log.i(TAG, "H.264: " + sent + " frames in last 5s (" + framed.length + "B last)");
+                    sent = 0; lastLog = System.currentTimeMillis();
+                }
+            }
+            return true;
+        } catch (Throwable t) {
+            Log.w(TAG, "H.264 capture unavailable: " + t);
+            return false;
+        } finally {
+            try { if (vd != null) vd.release(); } catch (Exception ignored) {}
+            try { if (mc != null) { mc.stop(); mc.release(); } } catch (Exception ignored) {}
+            try { if (surface != null) surface.release(); } catch (Exception ignored) {}
+            if (sender != null) sender.interrupt();
+        }
     }
 
     /**
