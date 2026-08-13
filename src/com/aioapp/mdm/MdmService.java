@@ -1408,11 +1408,14 @@ public class MdmService extends Service {
             // end of stream") or a transient stall on a large APK ("SocketTimeoutException")
             // no longer fails the whole install — the next attempt resumes from disk and the
             // final size is verified before we hand the file to PackageInstaller.
+            // The 15-min retry budget lets a real network disturbance recover and resume
+            // instead of hard-failing after a few attempts, matched to the server-side
+            // stalled-install sweep so a device that never recovers gives up in step. FW-2026-000020.
             reportInstallProgress(cmdId, serial, "downloading", expectedSize > 0 ? 0 : -1);
             showInstallNotification(title[0], "Downloading…", expectedSize > 0 ? 0 : -1, true);
             final int[] lastPct = { -1 };
             HttpDownloader.downloadWithResume(apkUrl, apkFile, expectedSize, etag,
-                    30_000, 60_000, 5,
+                    30_000, 60_000, 5, 15 * 60 * 1000L,
                     (downloaded, total) -> {
                         // Relay percent while we know the size, throttled to whole-5% steps
                         // so we don't spam the server on a fast link.

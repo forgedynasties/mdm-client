@@ -54,13 +54,39 @@ public final class HttpDownloader {
                                           int connectTimeoutMs, int readTimeoutMs, int maxAttempts,
                                           ProgressCallback progress, CancelCheck cancelled)
             throws IOException {
+        downloadWithResume(url, dest, expectedSize, etag, connectTimeoutMs, readTimeoutMs,
+                maxAttempts, 0L, progress, cancelled);
+    }
+
+    /**
+     * As {@link #downloadWithResume(String, File, long, String, int, int, int,
+     * ProgressCallback, CancelCheck)}, but when {@code maxTotalMillis > 0} the retry
+     * loop keeps resuming past {@code maxAttempts} until that wall-clock budget elapses.
+     *
+     * A real network disturbance surfaces as repeated connection timeouts that can
+     * outlast a small fixed attempt count — the download would hard-fail after a few
+     * seconds and leave the install stuck. The budget lets the download keep resuming
+     * (from the bytes already on disk) once connectivity returns, and bounds how long
+     * we try so a device that never recovers still gives up in step with the server's
+     * stalled-install sweep instead of hanging forever. FW-2026-000020.
+     *
+     * @param maxTotalMillis total retry budget in ms; {@code <=0} keeps the plain
+     *                       {@code maxAttempts} behaviour.
+     */
+    public static void downloadWithResume(String url, File dest, long expectedSize, String etag,
+                                          int connectTimeoutMs, int readTimeoutMs, int maxAttempts,
+                                          long maxTotalMillis, ProgressCallback progress, CancelCheck cancelled)
+            throws IOException {
+        long deadline = maxTotalMillis > 0 ? System.currentTimeMillis() + maxTotalMillis : 0;
         IOException last = null;
-        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+        for (int attempt = 1; ; attempt++) {
             if (cancelled != null && cancelled.isCancelled()) throw new IOException("download cancelled");
             if (attempt > 1) {
-                long backoffMs = Math.min(1000L << (attempt - 2), 16_000L); // 1s,2s,4s,8s,16s cap
-                Log.w(TAG, "retry " + attempt + "/" + maxAttempts + " after " + backoffMs + "ms: "
-                        + (last != null ? last.getMessage() : ""));
+                // 1s,2s,4s,8s,16s cap. Clamp the shift so a long budget-driven run can't
+                // overflow it once attempt climbs past a handful.
+                long backoffMs = Math.min(1000L << Math.min(attempt - 2, 4), 16_000L);
+                Log.w(TAG, "retry " + attempt + "/" + (deadline > 0 ? "budget" : String.valueOf(maxAttempts))
+                        + " after " + backoffMs + "ms: " + (last != null ? last.getMessage() : ""));
                 try {
                     Thread.sleep(backoffMs);
                 } catch (InterruptedException ie) {
@@ -77,6 +103,10 @@ public final class HttpDownloader {
                 // A cancel must abort immediately, not burn the remaining retries.
                 if (cancelled != null && cancelled.isCancelled()) throw e;
                 // Otherwise keep the partial file so the next attempt resumes from it.
+                boolean more = deadline > 0
+                        ? System.currentTimeMillis() < deadline
+                        : attempt < maxAttempts;
+                if (!more) break;
             }
         }
         throw last != null ? last : new IOException("download failed");
