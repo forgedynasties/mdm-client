@@ -822,12 +822,17 @@ public class MdmService extends Service {
             Log.e(TAG, "offline-exit savePolicy error: " + e.getMessage());
         }
         // WLC charging enable/disable. Persist so it survives a reboot (the sysfs line
-        // resets to on), and only touch the hardware on products that have a pad.
+        // resets to on), and only touch the hardware on products that have a pad. Config
+        // arrives on every check-in and telemetry frame, and several frames can interleave
+        // around a toggle — writing the gpio every time made it visibly flap. Write only
+        // when the target actually changes from what we last applied.
         if (config.has("wlc_charging_enabled")) {
             boolean wlc = config.optBoolean("wlc_charging_enabled", true);
             getSharedPreferences(PREFS_WLC, MODE_PRIVATE).edit()
                     .putBoolean(KEY_WLC_CHARGING, wlc).apply();
-            if (product.hasWlc()) setWlcCharging(wlc);
+            if (product.hasWlc() && (wlcLastApplied == null || wlcLastApplied.booleanValue() != wlc)) {
+                if (setWlcCharging(wlc)) wlcLastApplied = Boolean.valueOf(wlc);
+            }
         }
         try {
             KioskManager.applyAndSave(MdmService.this, dpm, adminComponent, config);
@@ -1636,18 +1641,27 @@ public class MdmService extends Service {
             // stalled-install sweep so a device that never recovers gives up in step. FW-2026-000020.
             reportInstallProgress(cmdId, serial, "downloading", expectedSize > 0 ? 0 : -1);
             showInstallNotification(title[0], "Downloading…", expectedSize > 0 ? 0 : -1, true);
-            final int[] lastPct = { -1 };
+            final int[] lastPct = { -1 };       // notification: fine-grained, every 1%
+            final int[] lastReported = { -1 };  // server report: throttled to 5% to avoid spam
             HttpDownloader.downloadWithResume(apkUrl, apkFile, expectedSize, etag,
                     30_000, 60_000, 5, 15 * 60 * 1000L,
                     (downloaded, total) -> {
-                        // Relay percent while we know the size, throttled to whole-5% steps
-                        // so we don't spam the server on a fast link.
                         if (total > 0) {
                             int pct = (int) (downloaded * 100 / total);
-                            if (pct >= lastPct[0] + 5 && pct < 100) {
+                            // Update the on-device notification on every 1% step, showing
+                            // downloaded / total MB alongside the progress bar.
+                            if (pct != lastPct[0] && pct < 100) {
                                 lastPct[0] = pct;
-                                reportInstallProgress(cmdId, serial, "downloading", pct);
-                                showInstallNotification(title[0], "Downloading… " + pct + "%", pct, true);
+                                double dMb = downloaded / 1048576.0, tMb = total / 1048576.0;
+                                showInstallNotification(title[0],
+                                        String.format(java.util.Locale.US, "Downloading… %.1f / %.1f MB", dMb, tMb),
+                                        pct, true);
+                                // Report to the server less often (every 5%) so a fast link
+                                // doesn't flood check-ins.
+                                if (pct >= lastReported[0] + 5) {
+                                    lastReported[0] = pct;
+                                    reportInstallProgress(cmdId, serial, "downloading", pct);
+                                }
                             }
                         }
                     },
@@ -2388,6 +2402,9 @@ public class MdmService extends Service {
     private static final String WLC_CHARGING_GPIO = "/sys/devices/platform/soc/soc:customer_gpio/gpio127";
     private static final String PREFS_WLC = "mdm_wlc";
     private static final String KEY_WLC_CHARGING = "wlc_charging_enabled";
+    // Last value actually written to the gpio, so repeated/interleaved config frames don't
+    // re-write (and flap) the line. null = not applied yet this process.
+    private Boolean wlcLastApplied = null;
 
     /** Write the wireless-charging enable line. Requires sepolicy allowing system_app to
      *  write the customer_gpio sysfs node (added in debug-GMS). Returns true on success. */
@@ -2420,7 +2437,7 @@ public class MdmService extends Service {
         if (!product.hasWlc()) return;
         boolean enabled = getSharedPreferences(PREFS_WLC, MODE_PRIVATE)
                 .getBoolean(KEY_WLC_CHARGING, true);
-        setWlcCharging(enabled);
+        if (setWlcCharging(enabled)) wlcLastApplied = Boolean.valueOf(enabled);
     }
 
     /** Sample gpio27 across WLC_BURST_MS and count 0<->1 transitions. Blocks the caller for
