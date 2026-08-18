@@ -1,5 +1,6 @@
 package com.aioapp.mdm;
 
+import android.app.ActivityManager;
 import android.app.ActivityOptions;
 import android.app.ActivityTaskManager;
 import android.app.admin.DevicePolicyManager;
@@ -9,6 +10,8 @@ import android.content.Intent;
 import android.provider.Settings;
 import android.util.Log;
 import org.json.JSONObject;
+
+import java.util.List;
 
 public class KioskManager {
     private static final String TAG = "KioskManager";
@@ -65,16 +68,56 @@ public class KioskManager {
                 Settings.Global.putString(ctx.getContentResolver(),
                         Settings.Global.POLICY_CONTROL, "");
 
-                // 3. Use ActivityOptions.setLockTaskEnabled(true) to launch the
-                //    third-party app directly into REAL lock task mode (API 28+).
-                //    This is the correct approach for device owners. Do NOT use
-                //    ActivityTaskManager.startSystemLockTaskMode() -- that triggers
-                //    screen pinning (weaker mode with "unpin" toast).
-                intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-                ActivityOptions options = ActivityOptions.makeBasic();
-                options.setLockTaskEnabled(true);
-                ctx.startActivity(intent, options.toBundle());
-                Log.i(TAG, "Launched " + pkg + " in lock task mode");
+                // 3. Enter REAL lock-task. Two paths, because ActivityOptions
+                //    .setLockTaskEnabled(true) ONLY takes effect when the activity is
+                //    freshly (re)created: if the kiosk app is already the resumed
+                //    foreground task, startActivity is a bring-to-front no-op and
+                //    lock-task is NEVER entered (the DPM package is whitelisted but
+                //    nothing pins the task, so home/recents stay live). Reproduced on
+                //    a T7: cold enable -> LOCKED, warm enable (app already foreground)
+                //    -> stuck NONE indefinitely.
+                //
+                //    Warm path: whenever a task for the kiosk app already exists (whether
+                //    foreground OR backgrounded to the launcher), force it into lock-task
+                //    in place with startSystemLockTaskMode(taskId) -- it also brings the
+                //    task to front. For a device owner whose package is in the lock-task
+                //    allowlist (set above) this enters full LOCKED mode; the "screen
+                //    pinning / unpin toast" caveat applies only to NON-allowlisted
+                //    packages, which is not our case.
+                int taskId = findRunningTaskId(ctx, pkg);
+                boolean entered = false;
+                if (taskId >= 0) {
+                    entered = forceSystemLockTask(taskId);
+                    if (entered) {
+                        Log.i(TAG, "Kiosk: forced running task " + taskId + " into lock task: " + pkg);
+                    }
+                }
+
+                //    Cold path (app not running/foreground, or the force call failed):
+                //    launch it fresh with the lock-task option so the new activity
+                //    enters lock-task on creation.
+                if (!entered) {
+                    intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    ActivityOptions options = ActivityOptions.makeBasic();
+                    options.setLockTaskEnabled(true);
+                    ctx.startActivity(intent, options.toBundle());
+                    Log.i(TAG, "Kiosk: cold-launched " + pkg + " in lock task mode");
+                }
+
+                // 4. Verify + escalate (only meaningful for the synchronous warm path;
+                //    a cold startActivity is async, so the watchdog re-checks it next
+                //    cycle). If we forced a running task but it still is not LOCKED,
+                //    relaunch clearing the task so a clean activity enters lock-task.
+                if (entered && !isLocked(ctx)) {
+                    Log.w(TAG, "Kiosk: force-lock did not stick, relaunching " + pkg + " (clear task)");
+                    Intent hard = ctx.getPackageManager().getLaunchIntentForPackage(pkg);
+                    if (hard != null) {
+                        hard.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
+                        ActivityOptions o2 = ActivityOptions.makeBasic();
+                        o2.setLockTaskEnabled(true);
+                        ctx.startActivity(hard, o2.toBundle());
+                    }
+                }
                 Log.i(TAG, "Kiosk enabled: pkg=" + pkg);
             } else {
                 stopSystemLockTask();
@@ -113,6 +156,64 @@ public class KioskManager {
         } catch (Exception ignored) {
         }
         Log.i(TAG, "Kiosk suspended locally (offline exit)");
+    }
+
+    /** True when the device is currently in lock-task (kiosk) mode. */
+    public static boolean isLocked(Context ctx) {
+        try {
+            ActivityManager am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+            return am != null && am.getLockTaskModeState() != ActivityManager.LOCK_TASK_MODE_NONE;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /** Package of the current foreground/top task, or "" if it can't be read.
+     *  Used to decide the warm-vs-cold entry path and by the MdmService watchdog. */
+    public static String foregroundPackage(Context ctx) {
+        try {
+            ActivityManager am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) return "";
+            List<ActivityManager.RunningTaskInfo> tasks = am.getRunningTasks(1);
+            if (tasks != null && !tasks.isEmpty()) {
+                ActivityManager.RunningTaskInfo t = tasks.get(0);
+                if (t.topActivity != null) return t.topActivity.getPackageName();
+                if (t.baseActivity != null) return t.baseActivity.getPackageName();
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "foregroundPackage error: " + e.getMessage());
+        }
+        return "";
+    }
+
+    /** Task id of a running task rooted at pkg, or -1 if none. Privileged/system app
+     *  (device owner) so getRunningTasks returns the real task list. */
+    private static int findRunningTaskId(Context ctx, String pkg) {
+        try {
+            ActivityManager am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am == null) return -1;
+            for (ActivityManager.RunningTaskInfo t : am.getRunningTasks(20)) {
+                String p = t.topActivity != null ? t.topActivity.getPackageName()
+                        : (t.baseActivity != null ? t.baseActivity.getPackageName() : null);
+                if (pkg.equals(p)) return t.taskId;
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "findRunningTaskId error: " + e.getMessage());
+        }
+        return -1;
+    }
+
+    /** Force an already-running task into REAL lock-task mode in place (no relaunch,
+     *  no app-state loss). Partner of stopSystemLockTaskMode() used below. Returns
+     *  false if the framework call throws. */
+    private static boolean forceSystemLockTask(int taskId) {
+        try {
+            ActivityTaskManager.getService().startSystemLockTaskMode(taskId);
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "forceSystemLockTask error: " + e.getMessage());
+            return false;
+        }
     }
 
     private static void stopSystemLockTask() {

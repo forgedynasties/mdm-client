@@ -314,8 +314,36 @@ public class MdmService extends Service {
         // LOCKED_BOOT_COMPLETED + BOOT_COMPLETED both fire on a fresh boot.
         alarmManager.cancel(pollIntent);
         if (networkAvailable && !polling) performCheckin();
+        enforceKioskLock(); // self-heal: re-assert lock-task if it has dropped
         scheduleNextPoll();
         return START_STICKY;
+    }
+
+    /**
+     * Kiosk watchdog. Kiosk policy is otherwise applied only when the server pushes a
+     * CHANGED config, so any drop of lock-task -- a warm apply that never entered it, the
+     * kiosk app crashing/relaunching, an errant stopLockTask, a reboot race -- would leave
+     * the device unlocked until someone toggles the config. This runs every poll and
+     * re-asserts the saved kiosk policy whenever the device should be locked but isn't
+     * (not LOCKED, or the wrong app is foreground). Honours the offline-exit suspension so
+     * a technician's local exit is not fought.
+     */
+    private void enforceKioskLock() {
+        try {
+            JSONObject cfg = KioskManager.loadConfig(this);
+            if (cfg == null || !cfg.optBoolean("kiosk_enabled", false)) return;
+            String pkg = cfg.optString("kiosk_package", "");
+            if (pkg.isEmpty()) return;
+            if (KioskExit.isSuspended(this)) return; // respect a verified offline exit
+            boolean locked = KioskManager.isLocked(this);
+            String fg = KioskManager.foregroundPackage(this);
+            if (!locked || !pkg.equals(fg)) {
+                Log.w(TAG, "kiosk watchdog: reasserting lock (locked=" + locked + " fg=" + fg + " want=" + pkg + ")");
+                KioskManager.apply(this, dpm, adminComponent, cfg);
+            }
+        } catch (Exception e) {
+            Log.e(TAG, "kiosk watchdog error: " + e.getMessage());
+        }
     }
 
     /** True when the device is currently in lock-task (kiosk) mode. */
