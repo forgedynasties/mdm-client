@@ -339,10 +339,12 @@ public class MdmService extends Service {
             String pkg = cfg.optString("kiosk_package", "");
             if (pkg.isEmpty()) return;
             if (KioskExit.isSuspended(this)) return; // respect a verified offline exit
-            boolean locked = KioskManager.isLocked(this);
+            // Use isProperlyLocked (LOCKED only): PINNED leaves the nav bar visible, so it
+            // must be treated as unlocked and re-asserted into a real device-owner lock.
+            boolean locked = KioskManager.isProperlyLocked(this);
             String fg = KioskManager.foregroundPackage(this);
             if (!locked || !pkg.equals(fg)) {
-                Log.w(TAG, "kiosk watchdog: reasserting lock (locked=" + locked + " fg=" + fg + " want=" + pkg + ")");
+                Log.w(TAG, "kiosk watchdog: reasserting lock (state=" + KioskManager.lockState(this) + " fg=" + fg + " want=" + pkg + ")");
                 KioskManager.apply(this, dpm, adminComponent, cfg);
             }
         } catch (Exception e) {

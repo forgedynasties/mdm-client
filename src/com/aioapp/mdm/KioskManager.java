@@ -68,55 +68,33 @@ public class KioskManager {
                 Settings.Global.putString(ctx.getContentResolver(),
                         Settings.Global.POLICY_CONTROL, "");
 
-                // 3. Enter REAL lock-task. Two paths, because ActivityOptions
-                //    .setLockTaskEnabled(true) ONLY takes effect when the activity is
-                //    freshly (re)created: if the kiosk app is already the resumed
-                //    foreground task, startActivity is a bring-to-front no-op and
-                //    lock-task is NEVER entered (the DPM package is whitelisted but
-                //    nothing pins the task, so home/recents stay live). Reproduced on
-                //    a T7: cold enable -> LOCKED, warm enable (app already foreground)
-                //    -> stuck NONE indefinitely.
-                //
-                //    Warm path: whenever a task for the kiosk app already exists (whether
-                //    foreground OR backgrounded to the launcher), force it into lock-task
-                //    in place with startSystemLockTaskMode(taskId) -- it also brings the
-                //    task to front. For a device owner whose package is in the lock-task
-                //    allowlist (set above) this enters full LOCKED mode; the "screen
-                //    pinning / unpin toast" caveat applies only to NON-allowlisted
-                //    packages, which is not our case.
-                int taskId = findRunningTaskId(ctx, pkg);
-                boolean entered = false;
-                if (taskId >= 0) {
-                    entered = forceSystemLockTask(taskId);
-                    if (entered) {
-                        Log.i(TAG, "Kiosk: forced running task " + taskId + " into lock task: " + pkg);
+                // 3. Enter REAL device-owner lock-task (LOCK_TASK_MODE_LOCKED — the mode
+                //    that hides the nav bar). The only reliable way in is
+                //    ActivityOptions.setLockTaskEnabled(true) on a FRESHLY CREATED activity.
+                //    startSystemLockTaskMode(taskId) on an already-running task was tried and
+                //    it enters screen-pinning (LOCK_TASK_MODE_PINNED) even for an allowlisted
+                //    device owner — the nav bar stays visible (reproduced on the T7). So:
+                //      - already properly LOCKED on the kiosk app -> nothing to do
+                //      - not running                             -> launch fresh -> LOCKED
+                //      - running (unlocked) or stuck PINNED       -> relaunch with CLEAR_TASK
+                //        so the activity is recreated and actually enters LOCKED
+                if (isProperlyLocked(ctx) && pkg.equals(foregroundPackage(ctx))) {
+                    Log.i(TAG, "Kiosk already LOCKED on " + pkg);
+                } else {
+                    if (lockState(ctx) == ActivityManager.LOCK_TASK_MODE_PINNED) {
+                        stopSystemLockTask(); // leave screen-pinning before relaunching into LOCKED
                     }
-                }
-
-                //    Cold path (app not running/foreground, or the force call failed):
-                //    launch it fresh with the lock-task option so the new activity
-                //    enters lock-task on creation.
-                if (!entered) {
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+                    boolean running = findRunningTaskId(ctx, pkg) >= 0;
+                    if (running) {
+                        // A live task won't re-create its activity on a plain relaunch, so
+                        // setLockTaskEnabled would be a no-op — clear it to force a fresh start.
+                        intent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK);
+                    }
                     ActivityOptions options = ActivityOptions.makeBasic();
                     options.setLockTaskEnabled(true);
                     ctx.startActivity(intent, options.toBundle());
-                    Log.i(TAG, "Kiosk: cold-launched " + pkg + " in lock task mode");
-                }
-
-                // 4. Verify + escalate (only meaningful for the synchronous warm path;
-                //    a cold startActivity is async, so the watchdog re-checks it next
-                //    cycle). If we forced a running task but it still is not LOCKED,
-                //    relaunch clearing the task so a clean activity enters lock-task.
-                if (entered && !isLocked(ctx)) {
-                    Log.w(TAG, "Kiosk: force-lock did not stick, relaunching " + pkg + " (clear task)");
-                    Intent hard = ctx.getPackageManager().getLaunchIntentForPackage(pkg);
-                    if (hard != null) {
-                        hard.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK | Intent.FLAG_ACTIVITY_CLEAR_TASK);
-                        ActivityOptions o2 = ActivityOptions.makeBasic();
-                        o2.setLockTaskEnabled(true);
-                        ctx.startActivity(hard, o2.toBundle());
-                    }
+                    Log.i(TAG, "Kiosk: launched " + pkg + " into lock task (clearTask=" + running + ")");
                 }
                 Log.i(TAG, "Kiosk enabled: pkg=" + pkg);
             } else {
@@ -170,14 +148,27 @@ public class KioskManager {
         Log.i(TAG, "Kiosk suspended locally (offline exit)");
     }
 
-    /** True when the device is currently in lock-task (kiosk) mode. */
-    public static boolean isLocked(Context ctx) {
+    /** Raw lock-task state: LOCK_TASK_MODE_NONE / _PINNED / _LOCKED. */
+    public static int lockState(Context ctx) {
         try {
             ActivityManager am = (ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
-            return am != null && am.getLockTaskModeState() != ActivityManager.LOCK_TASK_MODE_NONE;
+            if (am != null) return am.getLockTaskModeState();
         } catch (Exception e) {
-            return false;
+            Log.e(TAG, "lockState error: " + e.getMessage());
         }
+        return ActivityManager.LOCK_TASK_MODE_NONE;
+    }
+
+    /** True when in ANY lock-task mode (LOCKED or PINNED). */
+    public static boolean isLocked(Context ctx) {
+        return lockState(ctx) != ActivityManager.LOCK_TASK_MODE_NONE;
+    }
+
+    /** True ONLY for real device-owner lock (LOCK_TASK_MODE_LOCKED), which hides the nav
+     *  bar. PINNED (screen pinning) is deliberately NOT counted — it leaves the nav bar
+     *  visible, so the watchdog must treat it as "not locked" and re-assert. */
+    public static boolean isProperlyLocked(Context ctx) {
+        return lockState(ctx) == ActivityManager.LOCK_TASK_MODE_LOCKED;
     }
 
     /** Package of the current foreground/top task, or "" if it can't be read.
@@ -213,19 +204,6 @@ public class KioskManager {
             Log.e(TAG, "findRunningTaskId error: " + e.getMessage());
         }
         return -1;
-    }
-
-    /** Force an already-running task into REAL lock-task mode in place (no relaunch,
-     *  no app-state loss). Partner of stopSystemLockTaskMode() used below. Returns
-     *  false if the framework call throws. */
-    private static boolean forceSystemLockTask(int taskId) {
-        try {
-            ActivityTaskManager.getService().startSystemLockTaskMode(taskId);
-            return true;
-        } catch (Exception e) {
-            Log.e(TAG, "forceSystemLockTask error: " + e.getMessage());
-            return false;
-        }
     }
 
     /** Send the device to the launcher (used when leaving kiosk, so it isn't stranded on
