@@ -2606,13 +2606,17 @@ public class MdmService extends Service {
     }
 
     private Notification buildNotification(String text) {
-        return new Notification.Builder(this, CHANNEL_ID)
+        Notification n = new Notification.Builder(this, CHANNEL_ID)
                 .setContentTitle("AIO MDM")
                 .setContentText(text)
                 .setSmallIcon(R.drawable.ic_notify_shield)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .build();
+        // Keep the persistent status non-dismissible — setOngoing alone lets the user
+        // swipe a foreground-service notification away on modern Android.
+        n.flags |= Notification.FLAG_NO_CLEAR | Notification.FLAG_ONGOING_EVENT;
+        return n;
     }
 
     /**
