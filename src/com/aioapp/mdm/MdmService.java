@@ -47,6 +47,9 @@ public class MdmService extends Service {
     private static final String TAG = "MdmService";
     private static final String LOCATION_TAG = "MdmLocation";
     private static final String CHANNEL_ID = "MDM_SERVICE";
+    // Separate, gently-alerting channel for update / app-install completions, so the
+    // persistent status channel can stay silent.
+    private static final String UPDATES_CHANNEL_ID = "AIO_MDM_UPDATES";
     private static final int NOTIFICATION_ID = 1001;
 
     // Kiosk-exit gesture: SystemUI's long-press-Back arms an exit (via KioskExitReceiver
@@ -227,7 +230,7 @@ public class MdmService extends Service {
         // makes synchronous DPM binder calls that can stall past 5s on a cold fleet boot, so
         // promote to foreground FIRST, then do provisioning.
         createNotificationChannel();
-        startForeground(NOTIFICATION_ID, buildNotification("MDM service running"));
+        startForeground(NOTIFICATION_ID, buildNotification("Your device is set up and protected"));
         ensureDeviceOwner();
 
         // Product (resolved once at field init) gates the receiver registrations below and
@@ -300,6 +303,7 @@ public class MdmService extends Service {
         // pad. Kiosks have none, so there is nothing to sample — skip it entirely.
         if (product.hasWlc()) {
             startWlcWatcher();
+            applySavedWlcCharging(); // sysfs resets to on across reboot — restore the saved choice
         }
     }
 
@@ -726,20 +730,22 @@ public class MdmService extends Service {
     private OtaUpdateManager.Listener buildOtaListener() {
         return new OtaUpdateManager.Listener() {
             @Override public void onDownloadProgress(String phase, int percent) {
-                updateNotificationIfNeeded("System update: " + phase + " " + percent + "%");
+                updateNotificationIfNeeded("Updating your device… " + percent + "%");
                 sendOtaProgressFrame(otaCommandId, phase, percent);
             }
             @Override public void onDownloadComplete() {
-                updateNotificationIfNeeded("System update: download complete, installing…");
+                updateNotificationIfNeeded("Almost done — installing the update…");
                 reportOtaStatus(otaCommandId, "downloaded", null);
             }
             @Override public void onInstallComplete() {
-                updateNotificationIfNeeded("System update installed — awaiting reboot");
+                updateNotificationIfNeeded("Update ready — your device will restart to finish");
                 reportOtaStatus(otaCommandId, "installed", null);
                 otaCommandId = null;
             }
             @Override public void onError(String errorCode) {
-                updateNotificationIfNeeded("System update failed (" + errorCode + ")");
+                // Keep the user-facing text reassuring; the raw code goes to the log + server.
+                updateNotificationIfNeeded("Couldn't finish the update — it'll try again automatically");
+                Log.w(TAG, "OTA error: " + errorCode);
                 reportOtaStatus(otaCommandId, "error", errorCode);
                 otaCommandId = null;
             }
@@ -814,6 +820,14 @@ public class MdmService extends Service {
             }
         } catch (Exception e) {
             Log.e(TAG, "offline-exit savePolicy error: " + e.getMessage());
+        }
+        // WLC charging enable/disable. Persist so it survives a reboot (the sysfs line
+        // resets to on), and only touch the hardware on products that have a pad.
+        if (config.has("wlc_charging_enabled")) {
+            boolean wlc = config.optBoolean("wlc_charging_enabled", true);
+            getSharedPreferences(PREFS_WLC, MODE_PRIVATE).edit()
+                    .putBoolean(KEY_WLC_CHARGING, wlc).apply();
+            if (product.hasWlc()) setWlcCharging(wlc);
         }
         try {
             KioskManager.applyAndSave(MdmService.this, dpm, adminComponent, config);
@@ -1598,11 +1612,13 @@ public class MdmService extends Service {
                               long expectedSize, String etag) {
         // title[0] starts generic and is upgraded to the app's display label once the APK
         // is parsed, so the on-device notification (and its final result) names the app.
-        String[] title = { "App install" };
+        String[] title = { "AIO MDM" };
         String err = installApkInner(apkUrl, cmdId, serial, outPkg, expectedSize, etag, title);
         // Final result notification (dismissible; not ongoing) — reuses the same id so it
-        // replaces the progress notification in place.
-        showInstallNotification(title[0], err.isEmpty() ? "Installed" : "Install failed: " + err,
+        // replaces the progress notification in place. Keep it human; the raw error goes
+        // to the log + server, not the user.
+        if (!err.isEmpty()) Log.w(TAG, "APK install failed: " + err);
+        showInstallNotification(title[0], err.isEmpty() ? "Installed and ready" : "Couldn't install — we'll retry",
                 err.isEmpty() ? 100 : 0, false);
         return err;
     }
@@ -1631,7 +1647,7 @@ public class MdmService extends Service {
                             if (pct >= lastPct[0] + 5 && pct < 100) {
                                 lastPct[0] = pct;
                                 reportInstallProgress(cmdId, serial, "downloading", pct);
-                                showInstallNotification(title[0], "Downloading " + pct + "%", pct, true);
+                                showInstallNotification(title[0], "Downloading… " + pct + "%", pct, true);
                             }
                         }
                     },
@@ -1844,6 +1860,7 @@ public class MdmService extends Service {
         // kiosks so the server sees "no such hardware", not a stuck -1.
         if (product.hasWlc()) {
             extra.put("wlc_status", getWlcStatus());
+            extra.put("wlc_charging", readWlcCharging()); // reported so the dashboard shows real state
         }
         extra.put("ram_usage_mb", getRamUsageMb());
         extra.put("timezone", java.util.TimeZone.getDefault().getID());
@@ -2367,6 +2384,45 @@ public class MdmService extends Service {
         }
     }
 
+    // ── WLC charging enable/disable via customer_gpio gpio127 (1 = charging on, 0 = off) ──
+    private static final String WLC_CHARGING_GPIO = "/sys/devices/platform/soc/soc:customer_gpio/gpio127";
+    private static final String PREFS_WLC = "mdm_wlc";
+    private static final String KEY_WLC_CHARGING = "wlc_charging_enabled";
+
+    /** Write the wireless-charging enable line. Requires sepolicy allowing system_app to
+     *  write the customer_gpio sysfs node (added in debug-GMS). Returns true on success. */
+    private boolean setWlcCharging(boolean enable) {
+        try (java.io.FileWriter w = new java.io.FileWriter(WLC_CHARGING_GPIO)) {
+            w.write(enable ? "1" : "0");
+            w.flush();
+            Log.i(TAG, "WLC charging set " + (enable ? "on" : "off"));
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "setWlcCharging error: " + e.getMessage());
+            return false;
+        }
+    }
+
+    /** Current WLC charging line: true = on (1), false = off (0); true if unreadable. */
+    private boolean readWlcCharging() {
+        try (java.io.BufferedReader r = new java.io.BufferedReader(new java.io.FileReader(WLC_CHARGING_GPIO))) {
+            String line = r.readLine();
+            String v = line == null ? "" : line.replace("\0", "").trim();
+            return !v.equals("0");
+        } catch (Exception e) {
+            return true;
+        }
+    }
+
+    /** Re-apply the saved WLC charging setting — the sysfs line resets to on across a
+     *  reboot, so a device left "charging off" must be re-disabled on boot. */
+    private void applySavedWlcCharging() {
+        if (!product.hasWlc()) return;
+        boolean enabled = getSharedPreferences(PREFS_WLC, MODE_PRIVATE)
+                .getBoolean(KEY_WLC_CHARGING, true);
+        setWlcCharging(enabled);
+    }
+
     /** Sample gpio27 across WLC_BURST_MS and count 0<->1 transitions. Blocks the caller for
      *  the length of the burst; only the watcher thread calls it. -1 reads are skipped
      *  rather than counted, so a flaky sysfs read cannot masquerade as a floating line. */
@@ -2534,17 +2590,26 @@ public class MdmService extends Service {
     }
 
     private void createNotificationChannel() {
-        NotificationChannel channel = new NotificationChannel(
-                CHANNEL_ID, "MDM Service", NotificationManager.IMPORTANCE_LOW);
-        channel.setShowBadge(false);
-        getSystemService(NotificationManager.class).createNotificationChannel(channel);
+        NotificationManager nm = getSystemService(NotificationManager.class);
+        // Persistent status: silent, low-importance, no badge.
+        NotificationChannel status = new NotificationChannel(
+                CHANNEL_ID, "Device status", NotificationManager.IMPORTANCE_LOW);
+        status.setDescription("Shows that this device is set up and protected.");
+        status.setShowBadge(false);
+        nm.createNotificationChannel(status);
+        // Updates & app installs: gently alerting so a finished update can be noticed,
+        // without the persistent status ever making a sound.
+        NotificationChannel updates = new NotificationChannel(
+                UPDATES_CHANNEL_ID, "Updates", NotificationManager.IMPORTANCE_DEFAULT);
+        updates.setDescription("Progress and results for system updates and app installs.");
+        nm.createNotificationChannel(updates);
     }
 
     private Notification buildNotification(String text) {
         return new Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle("MDM Client")
+                .setContentTitle("AIO MDM")
                 .setContentText(text)
-                .setSmallIcon(android.R.drawable.ic_menu_info_details)
+                .setSmallIcon(R.drawable.ic_notify_shield)
                 .setOngoing(true)
                 .setOnlyAlertOnce(true)
                 .build();
@@ -2557,11 +2622,11 @@ public class MdmService extends Service {
      * posted with {@code ongoing=false} so the user can dismiss it. Thread-safe.
      */
     private void showInstallNotification(String title, String text, int percent, boolean ongoing) {
-        Notification.Builder b = new Notification.Builder(this, CHANNEL_ID)
-                .setContentTitle(title != null && !title.isEmpty() ? title : "App install")
+        Notification.Builder b = new Notification.Builder(this, UPDATES_CHANNEL_ID)
+                .setContentTitle(title != null && !title.isEmpty() ? title : "AIO MDM")
                 .setContentText(text)
-                .setSmallIcon(ongoing ? android.R.drawable.stat_sys_download
-                                      : android.R.drawable.stat_sys_download_done)
+                .setSmallIcon(ongoing ? R.drawable.ic_notify_download
+                                      : R.drawable.ic_notify_done)
                 .setOnlyAlertOnce(true)
                 .setOngoing(ongoing);
         if (ongoing) {

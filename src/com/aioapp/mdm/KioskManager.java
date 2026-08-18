@@ -120,14 +120,26 @@ public class KioskManager {
                 }
                 Log.i(TAG, "Kiosk enabled: pkg=" + pkg);
             } else {
-                stopSystemLockTask();
+                // Remove the package from the allowlist FIRST (that is what authorises the
+                // system to drop the task), then stop lock-task.
                 dpm.setLockTaskPackages(admin, new String[]{});
+                stopSystemLockTask();
                 Settings.Global.putString(ctx.getContentResolver(),
                         Settings.Global.POLICY_CONTROL, "");
                 // Server disabled kiosk — clear any local offline-exit suspension so a later
                 // re-enable (or a reboot) locks cleanly from a known state.
                 KioskExit.setSuspended(ctx, false);
-                Log.i(TAG, "Kiosk disabled");
+                // On this ROM, clearing the allowlist + stopSystemLockTaskMode does NOT always
+                // drop an already-active device-owner LOCKED task (server "off" reached the
+                // device and logged here, yet it stayed LOCKED). Nudge to the launcher and, if
+                // still locked, retry the exit once — so a server disable actually unlocks.
+                goHome(ctx);
+                if (isLocked(ctx)) {
+                    stopSystemLockTask();
+                    dpm.setLockTaskPackages(admin, new String[]{});
+                    goHome(ctx);
+                }
+                Log.i(TAG, "Kiosk disabled (stillLocked=" + isLocked(ctx) + ")");
             }
         } catch (Exception e) {
             Log.e(TAG, "apply error: " + e.getMessage());
@@ -213,6 +225,19 @@ public class KioskManager {
         } catch (Exception e) {
             Log.e(TAG, "forceSystemLockTask error: " + e.getMessage());
             return false;
+        }
+    }
+
+    /** Send the device to the launcher (used when leaving kiosk, so it isn't stranded on
+     *  the now-unlocked kiosk app). */
+    private static void goHome(Context ctx) {
+        try {
+            Intent home = new Intent(Intent.ACTION_MAIN);
+            home.addCategory(Intent.CATEGORY_HOME);
+            home.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+            ctx.startActivity(home);
+        } catch (Exception e) {
+            Log.e(TAG, "goHome error: " + e.getMessage());
         }
     }
 
