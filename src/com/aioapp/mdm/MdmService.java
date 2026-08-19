@@ -81,6 +81,10 @@ public class MdmService extends Service {
     private volatile boolean isCapturing = false;
     // Live logcat streams keyed by request_id; the Process is killed to stop a stream.
     private final java.util.Map<String, java.lang.Process> logcatStreams = new java.util.concurrent.ConcurrentHashMap<>();
+    // Command ids the server told us to cancel (operator deleted the action). An
+    // in-flight APK download polls this and aborts, so we stop pulling bytes for a
+    // command that no longer exists. Populated by the WS "cancel_command" frame.
+    private final java.util.Set<String> cancelledCommands = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private static final int MAX_LOGCAT_STREAMS = 3;
     private android.os.PowerManager.WakeLock remoteWakeLock;  // keeps the screen on during a remote session
     private static final long REMOTE_WAKE_TIMEOUT_MS = 30 * 60 * 1000L;  // safety cap so a dropped session can't pin the screen
@@ -946,6 +950,19 @@ public class MdmService extends Service {
                 if (lp != null) lp.destroyForcibly();
                 break;
             }
+            case "cancel_command": {
+                // Operator deleted/cancelled the action. Flag the id so an in-flight
+                // download aborts (checked every read chunk in installApkInner).
+                String cid = msg.optString("id", "");
+                if (!cid.isEmpty()) {
+                    cancelledCommands.add(cid);
+                    Log.i(TAG, "Cancel requested for command " + cid);
+                    // Bound the set so broadcast cancels for commands we never ran
+                    // can't accumulate forever.
+                    if (cancelledCommands.size() > 128) cancelledCommands.clear();
+                }
+                break;
+            }
             case "wake_screen":
                 wakeScreen(null);
                 break;
@@ -969,9 +986,17 @@ public class MdmService extends Service {
                 // APK URL) so the download can verify completeness and resume safely.
                 long apkSize = payload.optLong("apk_size", -1);
                 String apkEtag = payload.optString("apk_etag", null);
-                String err = installApk(cmd.getString("apk_url"), cmdId, serialNumber, pkgHolder,
-                        apkSize, apkEtag);
-                ackCommand(cmdId, serialNumber, err.isEmpty() ? "installed" : "failed", err, pkgHolder[0]);
+                try {
+                    String err = installApk(cmd.getString("apk_url"), cmdId, serialNumber, pkgHolder,
+                            apkSize, apkEtag);
+                    if (cancelledCommands.contains(cmdId)) {
+                        ackCommand(cmdId, serialNumber, "cancelled", "cancelled by operator", pkgHolder[0]);
+                    } else {
+                        ackCommand(cmdId, serialNumber, err.isEmpty() ? "installed" : "failed", err, pkgHolder[0]);
+                    }
+                } finally {
+                    cancelledCommands.remove(cmdId);
+                }
                 break;
             }
             case "uninstall": {
@@ -1675,7 +1700,9 @@ public class MdmService extends Service {
                             }
                         }
                     },
-                    null);
+                    // Abort mid-download if the operator deleted the action (server
+                    // pushes a cancel_command frame → cancelledCommands).
+                    () -> cancelledCommands.contains(cmdId));
             long written = apkFile.length();
             Log.i(TAG, "APK downloaded to " + apkFile.getAbsolutePath() + " (" + written + " bytes)");
             if (written == 0) return "download failed: empty file";
