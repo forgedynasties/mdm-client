@@ -1864,6 +1864,11 @@ public class MdmService extends Service {
                             || (ai.flags & android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0;
                 } catch (Exception ignore) {}
                 app.put("is_system", isSystem);
+                // Version name for the dashboard's app-info popup. Best-effort.
+                try {
+                    android.content.pm.PackageInfo pi = pm.getPackageInfo(pkg, 0);
+                    if (pi.versionName != null) app.put("version_name", pi.versionName);
+                } catch (Exception ignore) {}
                 // Launcher icon as a base64 PNG so the dashboard can render a real
                 // app-drawer icon. Best-effort — a failure just omits it (server falls
                 // back to a monogram). Sent only with the full app list (on change), so
