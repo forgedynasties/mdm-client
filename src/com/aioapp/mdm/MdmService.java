@@ -556,6 +556,16 @@ public class MdmService extends Service {
         executor.submit(() -> apiService.ackCommand(cmdId, serial, status, output, pkg));
     }
 
+    /** Terminal install ack over HTTP (never WS). A large install can outlast the WS
+     *  connection; the socket then goes half-open, wsClient.send() succeeds silently
+     *  into a dead pipe, and the server never gets the ack — the command shows 'failed'
+     *  though the app installed (the stalled-install sweep fails it, and reconcile could
+     *  not always recover it). HTTP has a real request/response, so the ack is confirmed
+     *  or logged, not lost. Used only for the install_apk terminal result. */
+    private void ackCommandHttp(String cmdId, String serial, String status, String output, String pkg) {
+        executor.submit(() -> apiService.ackCommand(cmdId, serial, status, output, pkg));
+    }
+
     private void reportLogcat(String requestId, String content) {
         if (wsClient != null && wsClient.isConnected()) {
             try {
@@ -990,9 +1000,12 @@ public class MdmService extends Service {
                     String err = installApk(cmd.getString("apk_url"), cmdId, serialNumber, pkgHolder,
                             apkSize, apkEtag);
                     if (cancelledCommands.contains(cmdId)) {
-                        ackCommand(cmdId, serialNumber, "cancelled", "cancelled by operator", pkgHolder[0]);
+                        ackCommandHttp(cmdId, serialNumber, "cancelled", "cancelled by operator", pkgHolder[0]);
                     } else {
-                        ackCommand(cmdId, serialNumber, err.isEmpty() ? "installed" : "failed", err, pkgHolder[0]);
+                        // HTTP (not WS): a long install can leave the WS half-open, silently
+                        // dropping a WS ack and making the install show 'failed' though it
+                        // succeeded.
+                        ackCommandHttp(cmdId, serialNumber, err.isEmpty() ? "installed" : "failed", err, pkgHolder[0]);
                     }
                 } finally {
                     cancelledCommands.remove(cmdId);
