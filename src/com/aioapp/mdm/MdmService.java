@@ -1856,12 +1856,38 @@ public class MdmService extends Service {
                             || (ai.flags & android.content.pm.ApplicationInfo.FLAG_UPDATED_SYSTEM_APP) != 0;
                 } catch (Exception ignore) {}
                 app.put("is_system", isSystem);
+                // Launcher icon as a base64 PNG so the dashboard can render a real
+                // app-drawer icon. Best-effort — a failure just omits it (server falls
+                // back to a monogram). Sent only with the full app list (on change), so
+                // this doesn't ride every check-in.
+                try {
+                    String icon = drawableToBase64Png(ri.loadIcon(pm), 96);
+                    if (icon != null) app.put("icon", icon);
+                } catch (Exception ignore) {}
                 apps.put(app);
             }
         } catch (Exception e) {
             Log.e(TAG, "getInstalledApps error: " + e.getMessage());
         }
         return apps;
+    }
+
+    /** Renders a Drawable to a size×size base64-encoded PNG (NO_WRAP), or null on error. */
+    private String drawableToBase64Png(android.graphics.drawable.Drawable d, int size) {
+        try {
+            if (d == null || size <= 0) return null;
+            android.graphics.Bitmap bmp = android.graphics.Bitmap.createBitmap(
+                    size, size, android.graphics.Bitmap.Config.ARGB_8888);
+            android.graphics.Canvas canvas = new android.graphics.Canvas(bmp);
+            d.setBounds(0, 0, size, size);
+            d.draw(canvas);
+            java.io.ByteArrayOutputStream out = new java.io.ByteArrayOutputStream();
+            bmp.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out);
+            bmp.recycle();
+            return android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP);
+        } catch (Throwable t) {
+            return null;
+        }
     }
 
     /** Builds the current full telemetry "extra" — a complete snapshot of every field. */
