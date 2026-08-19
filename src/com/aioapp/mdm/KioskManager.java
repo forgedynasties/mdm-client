@@ -107,15 +107,18 @@ public class KioskManager {
                 // Server disabled kiosk — clear any local offline-exit suspension so a later
                 // re-enable (or a reboot) locks cleanly from a known state.
                 KioskExit.setSuspended(ctx, false);
-                // On this ROM, clearing the allowlist + stopSystemLockTaskMode does NOT always
-                // drop an already-active device-owner LOCKED task (server "off" reached the
-                // device and logged here, yet it stayed LOCKED). Nudge to the launcher and, if
-                // still locked, retry the exit once — so a server disable actually unlocks.
-                goHome(ctx);
+                // Only touch the foreground if the device is STILL stuck in a LOCKED task
+                // (on this ROM, clearing the allowlist + stopSystemLockTaskMode doesn't always
+                // drop an active device-owner lock). When it's already unlocked, kiosk-off must
+                // NOT force HOME: the user is free to launch any app, and a blind goHome here
+                // bounced them out of whatever they opened every time config re-applied.
                 if (isLocked(ctx)) {
-                    stopSystemLockTask();
-                    dpm.setLockTaskPackages(admin, new String[]{});
                     goHome(ctx);
+                    if (isLocked(ctx)) {
+                        stopSystemLockTask();
+                        dpm.setLockTaskPackages(admin, new String[]{});
+                        goHome(ctx);
+                    }
                 }
                 Log.i(TAG, "Kiosk disabled (stillLocked=" + isLocked(ctx) + ")");
             }

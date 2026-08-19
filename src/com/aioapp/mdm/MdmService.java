@@ -836,8 +836,16 @@ public class MdmService extends Service {
                 if (setWlcCharging(wlc)) wlcLastApplied = Boolean.valueOf(wlc);
             }
         }
+        // Apply kiosk policy only when it actually changed. Config rides every check-in
+        // and telemetry frame (many per second when the charger flaps), and re-applying an
+        // unchanged policy churned lock-task/DPM state and forced HOME each time. The kiosk
+        // watchdog (enforceKioskLock) still re-asserts a dropped lock independently.
         try {
-            KioskManager.applyAndSave(MdmService.this, dpm, adminComponent, config);
+            String kioskSig = config.optBoolean("kiosk_enabled", false) + "|" + config.optString("kiosk_package", "");
+            if (!kioskSig.equals(kioskLastSig)) {
+                KioskManager.applyAndSave(MdmService.this, dpm, adminComponent, config);
+                kioskLastSig = kioskSig;
+            }
         } catch (Exception e) {
             Log.e(TAG, "kiosk applyAndSave error: " + e.getMessage());
         }
@@ -2433,6 +2441,7 @@ public class MdmService extends Service {
     // Last value actually written to the gpio, so repeated/interleaved config frames don't
     // re-write (and flap) the line. null = not applied yet this process.
     private Boolean wlcLastApplied = null;
+    private String kioskLastSig = null; // last applied "kiosk_enabled|kiosk_package"; gates re-apply
 
     /** Write the wireless-charging enable line. Requires sepolicy allowing system_app to
      *  write the customer_gpio sysfs node (added in debug-GMS). Returns true on success. */
