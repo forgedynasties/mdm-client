@@ -144,24 +144,23 @@ public class MdmService extends Service {
     private static final long WLC_WATCH_MS = 1_000;
     private volatile int lastWatchedWlc = Integer.MIN_VALUE; // last value the watcher observed
 
-    // Telling "no pad attached" from "guest placed/lifted" needs the line's rate of change,
-    // which no single read carries. Measured on gpio27 at 100 ms on two units: an unattached
-    // pad leaves the pin floating at ~2.7-2.8 Hz (324 and 338 edges per 60 s, half-period
-    // ~180 ms), while an attached pad is flat — 0 edges in 60 s, whether or not a guest is
-    // on it. Same signature on both units, so one threshold covers the fleet.
-    // 800 ms / 25 ms = 32 samples. Worst case across a full capture was 3 edges in any
-    // 800 ms window with no pad, against 0 with a pad, so 2 sits clear of both.
-    private static final long WLC_BURST_MS         = 800L;
-    private static final long WLC_BURST_STEP_MS    = 25L;
-    private static final int  WLC_BURST_EDGES      = 2;
-    // Once floating is latched, re-test only this often; that is what notices a pad being
-    // plugged in. Between tests the state is reported without touching sysfs.
-    private static final long WLC_FLOAT_RECHECK_MS = 30_000L;
+    // gpio27 only carries guest state while charging is ON (gpio127=1): STABLE 1 = guest
+    // on the pad, STABLE 0 = vacant. With charging OFF the line free-runs (toggles rapidly)
+    // and carries NO placement info — so to read placement while charging is disabled we
+    // briefly pulse gpio127=1, take a settled read, then restore. Characterized on-device
+    // with tools/wlc-gpio-matrix.sh and validated with tools/wlc-pulse-test.sh. The old
+    // "toggling == no pad" heuristic was wrong (toggling just means charging is off), and
+    // "no pad connected" is not detectable from this line at all (a disconnected pad reads
+    // identically to a placed guest when charging is on), so that status was dropped.
+    private static final int  WLC_SETTLE_READS    = 8;      // max reads to confirm a stable value
+    private static final int  WLC_SETTLE_AGREE    = 3;      // consecutive equal reads = settled
+    private static final long WLC_SETTLE_STEP_MS  = 20L;    // gap between settle reads
+    private static final long WLC_PULSE_SETTLE_MS = 350L;   // settle time after enabling charging to read
+    private static final long WLC_OFF_PULSE_MS    = 45_000L;// min interval between charge pulses while off
 
-    // Watcher thread only, except wlcFloating, which other threads read.
-    private int lastRawWlc = Integer.MIN_VALUE;
-    private long wlcFloatCheckedAt = 0L;
-    private volatile boolean wlcFloating = false;
+    // Watcher thread writes both; getWlcStatus() cold path reads lastPulsedWlc, so volatile.
+    private long wlcPulseAt = 0L;              // last pulse timestamp (rate-limit while charging off)
+    private volatile int lastPulsedWlc = -1;   // last value read via a pulse, held between pulses
 
     // Hardware product category (T7 vs Kiosk 18/22/27) + its capabilities, resolved once
     // in onCreate. Gates which telemetry we sample: a wall-powered kiosk has no battery,
@@ -973,6 +972,16 @@ public class MdmService extends Service {
                 }
                 break;
             }
+            case "checkin_now":
+                // Server nudge (e.g. an OTA was just assigned): do a full HTTP check-in
+                // immediately so the update resolves now instead of on the next periodic
+                // poll. performCheckin() self-guards against a concurrent poll.
+                executor.submit(() -> {
+                    try { performCheckin(); } catch (Exception e) {
+                        Log.e(TAG, "checkin_now error: " + e.getMessage());
+                    }
+                });
+                break;
             case "wake_screen":
                 wakeScreen(null);
                 break;
@@ -2451,7 +2460,10 @@ public class MdmService extends Service {
         synchronized (wlcLock) {
             if (wlcLastMs > 0 && now - wlcLastMs < WLC_CACHE_MS) return cachedWlcStatus;
         }
-        int v = readWlcStatusUncached();
+        // Cold path (the watcher hasn't populated the cache yet). Non-pulsing best effort so
+        // we never write gpio127 off the watcher thread: charging on -> settled gpio27;
+        // charging off -> last pulsed value (the watcher pulse-refreshes it on its cadence).
+        int v = readWlcCharging() ? readSettledWlc() : lastPulsedWlc;
         synchronized (wlcLock) {
             cachedWlcStatus = v;
             wlcLastMs = now;
@@ -2459,14 +2471,11 @@ public class MdmService extends Service {
         return v;
     }
 
-    /** Instantaneous, uncached read of the wireless-charging pad's guest-detection GPIO:
-     *  1 = guest device on the pad, 0 = none, -1 = unreadable. The GPIO is the authoritative
-     *  presence signal, so we read it regardless of the host's reported charging state — the
-     *  pad detects a guest even when the host itself shows no external power. (The former
-     *  "skip the read on battery" optimization assumed the pad only works while the host is on
-     *  external power, which is untrue for this hardware and reported a false 0.)
-     *  This is the bare line. Whether a pad is attached at all is a property of how the
-     *  line moves over time, not of any one sample — see classifyWlc(). */
+    /** Instantaneous, uncached read of the wireless-charging pad's guest-detection GPIO
+     *  (gpio27): 1 = line high, 0 = line low, -1 = unreadable. This is the BARE line; it
+     *  only means guest-present(1)/vacant(0) while charging is ON (gpio127=1). With charging
+     *  off the line free-runs and a single sample is meaningless — classifyWlc() handles that
+     *  by pulsing charging on to take a settled read. */
     private int readWlcStatusUncached() {
         final String gpioPath = "/sys/devices/platform/soc/soc:customer_gpio/gpio27";
         try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(gpioPath))) {
@@ -2522,62 +2531,64 @@ public class MdmService extends Service {
         if (setWlcCharging(enabled)) wlcLastApplied = Boolean.valueOf(enabled);
     }
 
-    /** Sample gpio27 across WLC_BURST_MS and count 0<->1 transitions. Blocks the caller for
-     *  the length of the burst; only the watcher thread calls it. -1 reads are skipped
-     *  rather than counted, so a flaky sysfs read cannot masquerade as a floating line. */
-    private int wlcBurstEdges() {
-        int edges = 0;
-        int prev = readWlcStatusUncached();
-        long deadline = SystemClock.elapsedRealtime() + WLC_BURST_MS;
-        while (SystemClock.elapsedRealtime() < deadline) {
+    /** Read gpio27 until WLC_SETTLE_AGREE consecutive reads agree, so a single glitchy
+     *  sample (or a mid-placement transition) doesn't flip the reported state. Returns
+     *  1 (guest on pad) / 0 (vacant), or -1 if it never settled / was unreadable. Only
+     *  meaningful while charging is ON — the caller ensures that. */
+    private int readSettledWlc() {
+        int stable = -1, agree = 0;
+        for (int i = 0; i < WLC_SETTLE_READS; i++) {
+            int v = readWlcStatusUncached();
+            if (v >= 0) {
+                if (v == stable) {
+                    if (++agree >= WLC_SETTLE_AGREE) return stable;
+                } else {
+                    stable = v;
+                    agree = 1;
+                }
+            }
             try {
-                Thread.sleep(WLC_BURST_STEP_MS);
+                Thread.sleep(WLC_SETTLE_STEP_MS);
             } catch (InterruptedException ie) {
                 Thread.currentThread().interrupt();
                 break;
             }
-            int v = readWlcStatusUncached();
-            if (v < 0) continue;
-            if (prev >= 0 && v != prev) edges++;
-            prev = v;
         }
-        return edges;
+        return stable; // best effort (may be -1 if never read cleanly)
     }
 
-    /** Map a raw gpio27 read to the reported wlc_status:
-     *  1 = guest on pad, 0 = pad idle, 2 = no pad connected, -1 = unreadable.
-     *  Watcher thread only. */
-    private int classifyWlc(int raw) {
+    /** Charging-aware WLC classification (watcher thread only). Returns 1 = guest on pad,
+     *  0 = vacant, -1 = unknown. gpio27 is a valid guest-detection line ONLY while charging
+     *  is ON (gpio127=1); with charging OFF it free-runs, so we briefly pulse charging on to
+     *  take a settled read, rate-limited so a device left with charging disabled isn't
+     *  constantly blipped. Never returns the old "2 = no pad" — that is undetectable from
+     *  this line (see tools/wlc-gpio-matrix.sh). */
+    private int classifyWlc() {
+        if (readWlcCharging()) {           // gpio127 == 1: the line is stable, trust it
+            return readSettledWlc();
+        }
+        // Charging OFF: gpio27 is meaningless as-is. Pulse charging on to read, rate-limited.
         long now = SystemClock.elapsedRealtime();
-        if (raw < 0) return -1;
-
-        if (wlcFloating) {
-            if (now - wlcFloatCheckedAt < WLC_FLOAT_RECHECK_MS) return 2;
-            wlcFloatCheckedAt = now;
-            if (wlcBurstEdges() >= WLC_BURST_EDGES) return 2;
-            wlcFloating = false;
-            lastRawWlc = readWlcStatusUncached();
-            Log.i(TAG, "WLC: line settled — pad connected, state " + lastRawWlc);
-            return lastRawWlc;
+        if (wlcPulseAt != 0 && now - wlcPulseAt < WLC_OFF_PULSE_MS) {
+            return lastPulsedWlc;          // hold the last pulsed value between pulses
         }
-
-        // Steady line: nothing to disambiguate, so skip the burst entirely. This is the
-        // common case on a working pad and costs one read per tick, as before.
-        if (raw == lastRawWlc) return raw;
-        lastRawWlc = raw;
-
-        // The line moved. A guest arriving or leaving and a floating pin look identical
-        // in a single sample, so measure the rate before believing it.
-        wlcFloatCheckedAt = now;
-        int edges = wlcBurstEdges();
-        if (edges >= WLC_BURST_EDGES) {
-            wlcFloating = true;
-            Log.i(TAG, "WLC: " + edges + " edges in " + WLC_BURST_MS + "ms — no pad connected");
-            return 2;
+        wlcPulseAt = now;
+        int v = -1;
+        setWlcCharging(true);
+        try {
+            Thread.sleep(WLC_PULSE_SETTLE_MS);
+            v = readSettledWlc();
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        } finally {
+            // Restore the operator's saved charging preference (we entered here because it
+            // was off, but a concurrent config change could have flipped the saved value).
+            boolean savedOn = getSharedPreferences(PREFS_WLC, MODE_PRIVATE)
+                    .getBoolean(KEY_WLC_CHARGING, true);
+            setWlcCharging(savedOn);
         }
-        // Settled during the burst, so re-read: the value that triggered this is 800 ms old.
-        lastRawWlc = readWlcStatusUncached();
-        return lastRawWlc;
+        if (v >= 0) lastPulsedWlc = v;
+        return lastPulsedWlc;
     }
 
     /** Poll the Qi pad's guest-detection GPIO on a short cadence and push telemetry the
@@ -2592,7 +2603,7 @@ public class MdmService extends Service {
         });
         wlcWatcher.scheduleWithFixedDelay(() -> {
             try {
-                int w = classifyWlc(readWlcStatusUncached());
+                int w = classifyWlc();
                 synchronized (wlcLock) {
                     cachedWlcStatus = w;
                     wlcLastMs = SystemClock.elapsedRealtime();

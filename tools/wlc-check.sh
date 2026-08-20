@@ -49,11 +49,16 @@ ADB="adb"; [ -n "$SERIAL" ] && ADB="adb -s $SERIAL"
 if ! $ADB shell true >/dev/null 2>&1; then
     echo "error: no device over adb (serial=${SERIAL:-auto})" >&2; exit 1
 fi
+# Root is NOT required — best-effort elevate (helps on userdebug/eng), then gate on
+# whether gpio27 is actually readable rather than on the uid.
 if [ "$($ADB shell id -u 2>/dev/null | tr -d '\r')" != "0" ]; then
-    $ADB root >/dev/null 2>&1; sleep 2
-    if [ "$($ADB shell id -u 2>/dev/null | tr -d '\r')" != "0" ]; then
-        echo "error: adb root required (userdebug/eng build)" >&2; exit 1
-    fi
+    $ADB root >/dev/null 2>&1 && sleep 2
+fi
+__probe="$($ADB shell "cat '$G27'" 2>/dev/null | tr -d '\r\n\000 ')"
+if [ "$__probe" != "0" ] && [ "$__probe" != "1" ]; then
+    echo "error: cannot read gpio27 at $G27 (got '${__probe:-<empty>}')." >&2
+    echo "       Wrong path? override with GPIO_DIR=..., or the node needs root/sepolicy." >&2
+    exit 1
 fi
 
 # read gpio127 (charging enable) — single read is enough, it's driven not floating.
