@@ -155,12 +155,6 @@ public class MdmService extends Service {
     private static final int  WLC_SETTLE_READS    = 8;      // max reads to confirm a stable value
     private static final int  WLC_SETTLE_AGREE    = 3;      // consecutive equal reads = settled
     private static final long WLC_SETTLE_STEP_MS  = 20L;    // gap between settle reads
-    private static final long WLC_PULSE_SETTLE_MS = 350L;   // settle time after enabling charging to read
-    private static final long WLC_OFF_PULSE_MS    = 45_000L;// min interval between charge pulses while off
-
-    // Watcher thread writes both; getWlcStatus() cold path reads lastPulsedWlc, so volatile.
-    private long wlcPulseAt = 0L;              // last pulse timestamp (rate-limit while charging off)
-    private volatile int lastPulsedWlc = -1;   // last value read via a pulse, held between pulses
 
     // Hardware product category (T7 vs Kiosk 18/22/27) + its capabilities, resolved once
     // in onCreate. Gates which telemetry we sample: a wall-powered kiosk has no battery,
@@ -2481,7 +2475,7 @@ public class MdmService extends Service {
         // Cold path (the watcher hasn't populated the cache yet). Non-pulsing best effort so
         // we never write gpio127 off the watcher thread: charging on -> settled gpio27;
         // charging off -> last pulsed value (the watcher pulse-refreshes it on its cadence).
-        int v = readWlcCharging() ? readSettledWlc() : lastPulsedWlc;
+        int v = readWlcCharging() ? readSettledWlc() : -1;
         synchronized (wlcLock) {
             cachedWlcStatus = v;
             wlcLastMs = now;
@@ -2576,37 +2570,16 @@ public class MdmService extends Service {
     }
 
     /** Charging-aware WLC classification (watcher thread only). Returns 1 = guest on pad,
-     *  0 = vacant, -1 = unknown. gpio27 is a valid guest-detection line ONLY while charging
-     *  is ON (gpio127=1); with charging OFF it free-runs, so we briefly pulse charging on to
-     *  take a settled read, rate-limited so a device left with charging disabled isn't
-     *  constantly blipped. Never returns the old "2 = no pad" — that is undetectable from
-     *  this line (see tools/wlc-gpio-matrix.sh). */
+     *  0 = vacant, -1 = unknown/not-available. gpio27 is a valid guest-detection line ONLY
+     *  while charging is ON (gpio127=1); with charging OFF it free-runs and is meaningless.
+     *  We deliberately do NOT pulse charging on to read it — that would deliver charge the
+     *  operator disabled — so charging-off reports unknown (-1) and the dashboard shows
+     *  "Not available". Never returns the old "2 = no pad" (undetectable from this line). */
     private int classifyWlc() {
         if (readWlcCharging()) {           // gpio127 == 1: the line is stable, trust it
             return readSettledWlc();
         }
-        // Charging OFF: gpio27 is meaningless as-is. Pulse charging on to read, rate-limited.
-        long now = SystemClock.elapsedRealtime();
-        if (wlcPulseAt != 0 && now - wlcPulseAt < WLC_OFF_PULSE_MS) {
-            return lastPulsedWlc;          // hold the last pulsed value between pulses
-        }
-        wlcPulseAt = now;
-        int v = -1;
-        setWlcCharging(true);
-        try {
-            Thread.sleep(WLC_PULSE_SETTLE_MS);
-            v = readSettledWlc();
-        } catch (InterruptedException ie) {
-            Thread.currentThread().interrupt();
-        } finally {
-            // Restore the operator's saved charging preference (we entered here because it
-            // was off, but a concurrent config change could have flipped the saved value).
-            boolean savedOn = getSharedPreferences(PREFS_WLC, MODE_PRIVATE)
-                    .getBoolean(KEY_WLC_CHARGING, true);
-            setWlcCharging(savedOn);
-        }
-        if (v >= 0) lastPulsedWlc = v;
-        return lastPulsedWlc;
+        return -1;                         // charging OFF: line not readable, report unknown
     }
 
     /** Poll the Qi pad's guest-detection GPIO on a short cadence and push telemetry the
