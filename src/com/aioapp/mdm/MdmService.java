@@ -1675,18 +1675,28 @@ public class MdmService extends Service {
         // title[0] starts generic and is upgraded to the app's display label once the APK
         // is parsed, so the on-device notification (and its final result) names the app.
         String[] title = { "AIO MDM" };
-        String err = installApkInner(apkUrl, cmdId, serial, outPkg, expectedSize, etag, title);
-        // Final result notification (dismissible; not ongoing) — reuses the same id so it
-        // replaces the progress notification in place. Keep it human; the raw error goes
+        // Distinct notification per install so concurrent installs don't overwrite each
+        // other's progress (they all shared INSTALL_NOTIFICATION_ID, so the notification
+        // "kept switching" between apps). Derived from cmdId → stable for this install.
+        int notifId = installNotifId(cmdId);
+        String err = installApkInner(apkUrl, cmdId, serial, outPkg, expectedSize, etag, title, notifId);
+        // Final result notification (dismissible; not ongoing) — reuses this install's id so
+        // it replaces the progress notification in place. Keep it human; the raw error goes
         // to the log + server, not the user.
         if (!err.isEmpty()) Log.w(TAG, "APK install failed: " + err);
-        showInstallNotification(title[0], err.isEmpty() ? "Installed and ready" : "Couldn't install — we'll retry",
+        showInstallNotification(notifId, title[0], err.isEmpty() ? "Installed and ready" : "Couldn't install — we'll retry",
                 err.isEmpty() ? 100 : 0, false);
         return err;
     }
 
+    /** A per-install notification id, distinct from the status (1001) and legacy install
+     *  (1002) ids, so several installs running at once each keep their own notification. */
+    private int installNotifId(String cmdId) {
+        return 2000 + Math.floorMod(cmdId == null ? 0 : cmdId.hashCode(), 100000);
+    }
+
     private String installApkInner(String apkUrl, String cmdId, String serial, String[] outPkg,
-                                   long expectedSize, String etag, String[] title) {
+                                   long expectedSize, String etag, String[] title, int notifId) {
         File apkFile = new File(getCacheDir(), "mdm_install_" + System.currentTimeMillis() + ".apk");
         try {
             // Download with Range resume + retry. A stale keep-alive socket ("unexpected
@@ -1697,7 +1707,7 @@ public class MdmService extends Service {
             // instead of hard-failing after a few attempts, matched to the server-side
             // stalled-install sweep so a device that never recovers gives up in step. FW-2026-000020.
             reportInstallProgress(cmdId, serial, "downloading", expectedSize > 0 ? 0 : -1);
-            showInstallNotification(title[0], "Downloading…", expectedSize > 0 ? 0 : -1, true);
+            showInstallNotification(notifId, title[0], "Downloading…", expectedSize > 0 ? 0 : -1, true);
             final int[] lastPct = { -1 };       // notification: fine-grained, every 1%
             final int[] lastReported = { -1 };  // server report: throttled to 5% to avoid spam
             HttpDownloader.downloadWithResume(apkUrl, apkFile, expectedSize, etag,
@@ -1710,7 +1720,7 @@ public class MdmService extends Service {
                             if (pct != lastPct[0] && pct < 100) {
                                 lastPct[0] = pct;
                                 double dMb = downloaded / 1048576.0, tMb = total / 1048576.0;
-                                showInstallNotification(title[0],
+                                showInstallNotification(notifId, title[0],
                                         String.format(java.util.Locale.US, "Downloading… %.1f / %.1f MB", dMb, tMb),
                                         pct, true);
                                 // Report to the server less often (every 5%) so a fast link
@@ -1748,9 +1758,17 @@ public class MdmService extends Service {
                 }
                 Log.i(TAG, "APK package: " + apkPackageName);
             } else {
-                Log.e(TAG, "APK could not be parsed (corrupt or not an APK): " + apkUrl);
+                // The downloaded file doesn't parse as an APK — almost always a corrupt or
+                // truncated download (a flaky host with no known size to verify against).
+                // Fail here with a clear, actionable reason instead of handing a bad file to
+                // PackageInstaller, which only reports a generic "status=1". The retry budget
+                // will re-download and resume.
+                Log.e(TAG, "APK could not be parsed (corrupt/truncated download): " + apkUrl
+                        + " (" + written + " bytes)");
+                apkFile.delete();
+                return "download appears corrupt (unparseable APK, " + written + " bytes) — will retry";
             }
-            showInstallNotification(title[0], "Installing…", -1, true);
+            showInstallNotification(notifId, title[0], "Installing…", -1, true);
 
             // Install via PackageInstaller API
             PackageInstaller installer = getPackageManager().getPackageInstaller();
@@ -2735,7 +2753,7 @@ public class MdmService extends Service {
      * determinate when {@code percent >= 0}, indeterminate otherwise; the final result is
      * posted with {@code ongoing=false} so the user can dismiss it. Thread-safe.
      */
-    private void showInstallNotification(String title, String text, int percent, boolean ongoing) {
+    private void showInstallNotification(int notifId, String title, String text, int percent, boolean ongoing) {
         Notification.Builder b = new Notification.Builder(this, UPDATES_CHANNEL_ID)
                 .setContentTitle(title != null && !title.isEmpty() ? title : "AIO MDM")
                 .setContentText(text)
@@ -2747,7 +2765,7 @@ public class MdmService extends Service {
             if (percent >= 0) b.setProgress(100, percent, false);
             else b.setProgress(0, 0, true); // indeterminate (installing / unknown size)
         }
-        getSystemService(NotificationManager.class).notify(INSTALL_NOTIFICATION_ID, b.build());
+        getSystemService(NotificationManager.class).notify(notifId, b.build());
     }
 
     @Override
