@@ -85,6 +85,22 @@ public class MdmService extends Service {
     // in-flight APK download polls this and aborts, so we stop pulling bytes for a
     // command that no longer exists. Populated by the WS "cancel_command" frame.
     private final java.util.Set<String> cancelledCommands = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    // ── Command idempotency + reliable terminal acks ─────────────────────────────
+    // Ids currently executing, so a re-delivered command is not run a second time.
+    private final java.util.Set<String> inFlightCommands = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    // Recently-completed command ids (bounded, persisted) so a re-delivery AFTER completion
+    // is not re-run. Guarded by its own monitor.
+    private final java.util.LinkedHashSet<String> recentDoneCommands = new java.util.LinkedHashSet<>();
+    // Terminal acks not yet CONFIRMED by the server, persisted so a 'completed'/'failed'
+    // survives a half-open socket or a process restart. cmdId → ack JSON. Guarded by itself.
+    private final java.util.LinkedHashMap<String, JSONObject> pendingAcks = new java.util.LinkedHashMap<>();
+    private static final String PREFS_CMD = "mdm_cmd";
+    private static final String KEY_DONE_CMDS = "recent_done_commands";
+    private static final String KEY_PENDING_ACKS = "pending_acks";
+    private static final int MAX_DONE_CMDS = 200;
+    private volatile boolean cmdStateLoaded = false;
+
     private static final int MAX_LOGCAT_STREAMS = 3;
     private android.os.PowerManager.WakeLock remoteWakeLock;  // keeps the screen on during a remote session
     private static final long REMOTE_WAKE_TIMEOUT_MS = 30 * 60 * 1000L;  // safety cap so a dropped session can't pin the screen
@@ -219,6 +235,9 @@ public class MdmService extends Service {
         wifiScanExecutor = Executors.newSingleThreadScheduledExecutor();
         wifiScanExecutor.scheduleWithFixedDelay(this::runWifiScan, 0, WIFI_SCAN_INTERVAL_SEC, TimeUnit.SECONDS);
         apiService = new MdmApiService();
+        // Restore command dedup + any terminal acks that weren't confirmed before a restart,
+        // and try to flush the acks now (also retried on every reconnect).
+        loadCommandState();
         connectivityManager = (ConnectivityManager) getSystemService(Context.CONNECTIVITY_SERVICE);
         dpm = (DevicePolicyManager) getSystemService(Context.DEVICE_POLICY_SERVICE);
         adminComponent = new ComponentName(this, MdmAdminReceiver.class);
@@ -549,14 +568,123 @@ public class MdmService extends Service {
         executor.submit(() -> apiService.ackCommand(cmdId, serial, status, output, pkg));
     }
 
-    /** Terminal install ack over HTTP (never WS). A large install can outlast the WS
-     *  connection; the socket then goes half-open, wsClient.send() succeeds silently
-     *  into a dead pipe, and the server never gets the ack — the command shows 'failed'
-     *  though the app installed (the stalled-install sweep fails it, and reconcile could
-     *  not always recover it). HTTP has a real request/response, so the ack is confirmed
-     *  or logged, not lost. Used only for the install_apk terminal result. */
-    private void ackCommandHttp(String cmdId, String serial, String status, String output, String pkg) {
-        executor.submit(() -> apiService.ackCommand(cmdId, serial, status, output, pkg));
+    // ── Command idempotency + reliable terminal acks ─────────────────────────────
+
+    /** Load persisted dedup + pending-ack state once, on startup. */
+    private synchronized void loadCommandState() {
+        if (cmdStateLoaded) return;
+        cmdStateLoaded = true;
+        android.content.SharedPreferences sp = getSharedPreferences(PREFS_CMD, MODE_PRIVATE);
+        String done = sp.getString(KEY_DONE_CMDS, "");
+        if (!done.isEmpty()) {
+            synchronized (recentDoneCommands) {
+                for (String id : done.split(",")) if (!id.isEmpty()) recentDoneCommands.add(id);
+            }
+        }
+        String acks = sp.getString(KEY_PENDING_ACKS, "");
+        if (!acks.isEmpty()) {
+            try {
+                org.json.JSONArray arr = new org.json.JSONArray(acks);
+                synchronized (pendingAcks) {
+                    for (int i = 0; i < arr.length(); i++) {
+                        JSONObject a = arr.getJSONObject(i);
+                        pendingAcks.put(a.getString("command_id"), a);
+                    }
+                }
+            } catch (Exception e) { Log.e(TAG, "loadCommandState acks: " + e.getMessage()); }
+        }
+        drainPendingAcks();
+    }
+
+    /** Entry point for an incoming WS command: confirm receipt, dedup, then run. */
+    private void handleIncomingCommand(JSONObject msg) {
+        final String cmdId = msg.optString("id", "");
+        if (cmdId.isEmpty()) { Log.w(TAG, "WS command with no id"); return; }
+        // 1. Always confirm receipt so the server stops re-delivering — even a duplicate.
+        sendReceived(cmdId);
+        // 2. Idempotency: never execute a command already finished or still running.
+        boolean alreadyDone;
+        synchronized (recentDoneCommands) { alreadyDone = recentDoneCommands.contains(cmdId); }
+        if (alreadyDone || !inFlightCommands.add(cmdId)) {
+            Log.i(TAG, "Duplicate command " + cmdId + " ignored (already handled/in-flight)");
+            return;
+        }
+        heavyExecutor.submit(() -> {
+            try {
+                processWsCommand(msg);
+            } catch (Exception e) {
+                Log.e(TAG, "WS command error: " + e.getMessage());
+            } finally {
+                markCommandDone(cmdId);
+            }
+        });
+    }
+
+    /** Confirm receipt of a command (before/independent of executing it). */
+    private void sendReceived(String cmdId) {
+        ackCommand(cmdId, getDeviceSerial(), "received", "");
+    }
+
+    private void markCommandDone(String cmdId) {
+        inFlightCommands.remove(cmdId);
+        synchronized (recentDoneCommands) {
+            recentDoneCommands.remove(cmdId);
+            recentDoneCommands.add(cmdId);
+            while (recentDoneCommands.size() > MAX_DONE_CMDS) {
+                java.util.Iterator<String> it = recentDoneCommands.iterator();
+                it.next(); it.remove();
+            }
+            getSharedPreferences(PREFS_CMD, MODE_PRIVATE).edit()
+                    .putString(KEY_DONE_CMDS, String.join(",", recentDoneCommands)).apply();
+        }
+    }
+
+    /** Terminal command result. Persisted and retried over HTTP until the server confirms,
+     *  so a 'completed'/'failed' is never lost to a half-open socket or a process restart.
+     *  Replaces the old fire-and-forget WS/HTTP terminal acks. */
+    private void reportTerminal(String cmdId, String serial, String status, String output) {
+        reportTerminal(cmdId, serial, status, output, null);
+    }
+    private void reportTerminal(String cmdId, String serial, String status, String output, String pkg) {
+        try {
+            JSONObject a = new JSONObject();
+            a.put("command_id", cmdId);
+            a.put("serial_number", serial);
+            a.put("status", status);
+            if (output != null && !output.isEmpty()) a.put("output", output);
+            if (pkg != null && !pkg.isEmpty()) a.put("package", pkg);
+            synchronized (pendingAcks) { pendingAcks.put(cmdId, a); persistPendingAcks(); }
+        } catch (Exception e) { Log.e(TAG, "reportTerminal: " + e.getMessage()); }
+        drainPendingAcks();
+    }
+
+    /** persist pendingAcks; caller holds the monitor. */
+    private void persistPendingAcks() {
+        org.json.JSONArray arr = new org.json.JSONArray();
+        for (JSONObject a : pendingAcks.values()) arr.put(a);
+        getSharedPreferences(PREFS_CMD, MODE_PRIVATE).edit()
+                .putString(KEY_PENDING_ACKS, arr.toString()).apply();
+    }
+
+    /** Deliver every not-yet-confirmed terminal ack over HTTP; drop each on a 2xx. Safe to
+     *  call repeatedly (on reconnect, on report, on startup) — server acks are idempotent. */
+    private void drainPendingAcks() {
+        executor.submit(() -> {
+            java.util.List<JSONObject> snapshot;
+            synchronized (pendingAcks) {
+                if (pendingAcks.isEmpty()) return;
+                snapshot = new java.util.ArrayList<>(pendingAcks.values());
+            }
+            for (JSONObject a : snapshot) {
+                boolean ok = apiService.ackCommandOk(
+                        a.optString("command_id"), a.optString("serial_number"),
+                        a.optString("status"), a.optString("output", ""),
+                        a.has("package") ? a.optString("package") : null);
+                if (ok) {
+                    synchronized (pendingAcks) { pendingAcks.remove(a.optString("command_id")); persistPendingAcks(); }
+                }
+            }
+        });
     }
 
     private void reportLogcat(String requestId, String content) {
@@ -864,7 +992,7 @@ public class MdmService extends Service {
         wsClient = new MdmWebSocketClient(apiService.getApiBaseUrl(), serial, apiService.getApiKey());
         wsClient.setListener(this::handleWsMessage);
         // On every (re)connect the server has no baseline for us — send a full keyframe.
-        wsClient.setConnectedCallback(() -> { forceKeyframe = true; sendTelemetryOverWs(); });
+        wsClient.setConnectedCallback(() -> { forceKeyframe = true; sendTelemetryOverWs(); drainPendingAcks(); });
         wsClient.start();
         Log.i(TAG, "WebSocket client started");
     }
@@ -873,11 +1001,7 @@ public class MdmService extends Service {
         String type = msg.optString("type", "");
         switch (type) {
             case "command":
-                heavyExecutor.submit(() -> {
-                    try { processWsCommand(msg); } catch (Exception e) {
-                        Log.e(TAG, "WS command error: " + e.getMessage());
-                    }
-                });
+                handleIncomingCommand(msg);
                 break;
             case "logcat_request":
                 heavyExecutor.submit(() -> {
@@ -1003,12 +1127,12 @@ public class MdmService extends Service {
                     String err = installApk(cmd.getString("apk_url"), cmdId, serialNumber, pkgHolder,
                             apkSize, apkEtag);
                     if (cancelledCommands.contains(cmdId)) {
-                        ackCommandHttp(cmdId, serialNumber, "cancelled", "cancelled by operator", pkgHolder[0]);
+                        reportTerminal(cmdId, serialNumber, "cancelled", "cancelled by operator", pkgHolder[0]);
                     } else {
                         // HTTP (not WS): a long install can leave the WS half-open, silently
                         // dropping a WS ack and making the install show 'failed' though it
                         // succeeded.
-                        ackCommandHttp(cmdId, serialNumber, err.isEmpty() ? "installed" : "failed", err, pkgHolder[0]);
+                        reportTerminal(cmdId, serialNumber, err.isEmpty() ? "installed" : "failed", err, pkgHolder[0]);
                     }
                 } finally {
                     cancelledCommands.remove(cmdId);
@@ -1018,23 +1142,23 @@ public class MdmService extends Service {
             case "uninstall": {
                 String pkg = payload.optString("package", "");
                 if (pkg.isEmpty()) {
-                    ackCommand(cmdId, serialNumber, "failed", "missing package");
+                    reportTerminal(cmdId, serialNumber, "failed", "missing package");
                     break;
                 }
                 String err = uninstallPackage(pkg);
-                ackCommand(cmdId, serialNumber, err == null ? "completed" : "failed",
+                reportTerminal(cmdId, serialNumber, err == null ? "completed" : "failed",
                         err == null ? ("uninstalled " + pkg) : err);
                 break;
             }
             case "shell": {
                 String shellCmd = payload.optString("cmd", "");
                 if (shellCmd.isEmpty()) {
-                    ackCommand(cmdId, serialNumber, "failed", "empty cmd");
+                    reportTerminal(cmdId, serialNumber, "failed", "empty cmd");
                     break;
                 }
                 if (!isShellCommandAllowed(shellCmd)) {
                     Log.w(TAG, "Rejected shell command not on allowlist: " + shellCmd);
-                    ackCommand(cmdId, serialNumber, "failed", "command not permitted");
+                    reportTerminal(cmdId, serialNumber, "failed", "command not permitted");
                     break;
                 }
                 java.lang.Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", shellCmd});
@@ -1083,7 +1207,7 @@ public class MdmService extends Service {
                 // HTTP-ack to persist status in DB
                 String output = collected.length() > 0 ? collected.toString()
                         : stderrBuf.toString(StandardCharsets.UTF_8);
-                ackCommand(cmdId, serialNumber, exitCode == 0 ? "completed" : "failed", output);
+                reportTerminal(cmdId, serialNumber, exitCode == 0 ? "completed" : "failed", output);
                 break;
             }
             case "screenshot": {
@@ -1100,7 +1224,7 @@ public class MdmService extends Service {
                         int n;
                         while ((n = fis.read(buf)) != -1) enc.write(buf, 0, n);
                     }
-                    ackCommand(cmdId, serialNumber, "completed",
+                    reportTerminal(cmdId, serialNumber, "completed",
                             b64Buf.toString(StandardCharsets.UTF_8.name()));
                 } finally {
                     tmp.delete();
@@ -1108,7 +1232,7 @@ public class MdmService extends Service {
                 break;
             }
             case "get_app_inventory": {
-                ackCommand(cmdId, serialNumber, "completed", getInstalledApps().toString());
+                reportTerminal(cmdId, serialNumber, "completed", getInstalledApps().toString());
                 break;
             }
             case "reboot": {
@@ -1154,13 +1278,13 @@ public class MdmService extends Service {
                 // transport the file and trigger. Runs on the worker thread.
                 String splashUrl = payload.optString("url", "");
                 if (splashUrl.isEmpty()) {
-                    ackCommand(cmdId, serialNumber, "failed", "missing url");
+                    reportTerminal(cmdId, serialNumber, "failed", "missing url");
                     break;
                 }
                 long partitionSize = payload.optLong("partition_size", 0);
                 String status = downloadAndUpdateSplash(splashUrl, partitionSize);
                 boolean ok = "ok".equals(status);
-                ackCommand(cmdId, serialNumber, ok ? "completed" : "failed", status);
+                reportTerminal(cmdId, serialNumber, ok ? "completed" : "failed", status);
                 break;
             }
             case "start_capture": {
@@ -1175,18 +1299,18 @@ public class MdmService extends Service {
                     acquireRemoteWakeLock();
                     heavyExecutor.submit(() -> runCaptureLoop(codec, quality, scale, maxFps, bitrate));
                 }
-                ackCommand(cmdId, serialNumber, "completed", "");
+                reportTerminal(cmdId, serialNumber, "completed", "");
                 break;
             }
             case "stop_capture": {
                 isCapturing = false;
                 releaseRemoteWakeLock();
-                ackCommand(cmdId, serialNumber, "completed", "");
+                reportTerminal(cmdId, serialNumber, "completed", "");
                 break;
             }
             default:
                 Log.w(TAG, "Unknown command type: " + cmdType);
-                ackCommand(cmdId, serialNumber, "failed", "unknown type: " + cmdType);
+                reportTerminal(cmdId, serialNumber, "failed", "unknown type: " + cmdType);
         }
     }
 

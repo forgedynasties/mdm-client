@@ -205,6 +205,24 @@ public class MdmApiService {
         }
     }
 
+    /** Like ackCommand, but returns whether the server accepted it (2xx) so a caller can
+     *  retry a terminal ack until it's confirmed. output may be empty; pkg may be null. */
+    public boolean ackCommandOk(String commandId, String serialNumber, String status, String output, String pkg) {
+        try {
+            JSONObject body = new JSONObject();
+            body.put("serial_number", serialNumber);
+            body.put("status", status);
+            if (output != null && !output.isEmpty()) body.put("output", output);
+            if (pkg != null && !pkg.isEmpty()) body.put("package", pkg);
+            PostResult result = doPost("/api/v1/commands/" + commandId + "/ack", body.toString());
+            Log.d(TAG, "Ack(ok) command " + commandId + " status=" + status + " response=" + result.code);
+            return result != null && result.code >= 200 && result.code < 300;
+        } catch (Exception e) {
+            Log.e(TAG, "ackCommandOk failed: " + e.getMessage());
+            return false;
+        }
+    }
+
     /**
      * POST /api/v1/commands/{id}/ack — interim install progress.
      * status = "downloading" | "installing"; percent 0-100 (meaningful while
