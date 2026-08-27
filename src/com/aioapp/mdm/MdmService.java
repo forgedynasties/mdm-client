@@ -177,13 +177,20 @@ public class MdmService extends Service {
     // on the pad, STABLE 0 = vacant. With charging OFF the line free-runs (toggles rapidly)
     // and carries NO placement info — so to read placement while charging is disabled we
     // briefly pulse gpio127=1, take a settled read, then restore. Characterized on-device
-    // with tools/wlc-gpio-matrix.sh and validated with tools/wlc-pulse-test.sh. The old
-    // "toggling == no pad" heuristic was wrong (toggling just means charging is off), and
-    // "no pad connected" is not detectable from this line at all (a disconnected pad reads
-    // identically to a placed guest when charging is on), so that status was dropped.
-    private static final int  WLC_SETTLE_READS    = 8;      // max reads to confirm a stable value
-    private static final int  WLC_SETTLE_AGREE    = 3;      // consecutive equal reads = settled
-    private static final long WLC_SETTLE_STEP_MS  = 20L;    // gap between settle reads
+    // with tools/wlc-gpio-matrix.sh and validated with tools/wlc-pulse-test.sh.
+    //
+    // While charging IS on, a genuinely faulty/loose pad connection makes gpio27 toggle
+    // continuously too — field capture (tools/wlc-check.sh --watch, and a raw per-sample
+    // adb loop) on real hardware showed edges roughly every 65-200ms, non-stop, for as
+    // long as it was watched. That's faster than a "read 3 times, 20ms apart, wait for
+    // agreement" scheme reliably catches: reads can land within one half-cycle by pure
+    // luck and falsely report "settled" (to whichever value the phase happened to be on).
+    // So this burst-samples over a window comfortably longer than the worst edge gap seen
+    // and classifies by counting edges in that raw sequence instead — the same method
+    // tools/wlc-check.sh already uses for its own live classification.
+    private static final int  WLC_SETTLE_READS    = 24;     // burst-sample count
+    private static final long WLC_SETTLE_STEP_MS  = 10L;    // gap between samples (~240ms total window)
+    private static final int  WLC_SETTLE_MIN_EDGES = 2;     // this many transitions in the burst = flapping
 
     // Hardware product category (T7 vs Kiosk 18/22/27) + its capabilities, resolved once
     // in onCreate. Gates which telemetry we sample: a wall-powered kiosk has no battery,
@@ -2680,34 +2687,26 @@ public class MdmService extends Service {
         if (setWlcCharging(enabled)) wlcLastApplied = Boolean.valueOf(enabled);
     }
 
-    // Reported when charging is ON but gpio27 never settles to WLC_SETTLE_AGREE consecutive
-    // reads — the line is genuinely oscillating (observed in the field on hardware that should
-    // hold steady), not just a single glitchy sample. Distinct from -1 (charging off / unreadable).
+    // Reported when charging is ON but gpio27 shows WLC_SETTLE_MIN_EDGES+ transitions within
+    // one burst-sample window — the line is genuinely oscillating (observed in the field on
+    // hardware with a faulty/loose pad connection), not just a single glitchy sample. Distinct
+    // from -1 (charging off / unreadable).
     private static final int WLC_STATUS_FLAPPING = 2;
 
-    /** Read gpio27 until WLC_SETTLE_AGREE consecutive reads agree, so a single glitchy
-     *  sample (or a mid-placement transition) doesn't flip the reported state. Returns
-     *  1 (guest on pad) / 0 (vacant) on real consensus, WLC_STATUS_FLAPPING if valid reads
-     *  came back but kept disagreeing, or -1 if every read was unreadable. Only meaningful
-     *  while charging is ON — the caller ensures that. */
+    /** Burst-samples gpio27 over ~WLC_SETTLE_READS*WLC_SETTLE_STEP_MS and classifies by edge
+     *  count in that raw sequence (mirrors tools/wlc-check.sh's classify()) — see the
+     *  WLC_SETTLE_* field comments for why this replaced a "3 consecutive reads agree"
+     *  scheme. Returns 1 (guest on pad) / 0 (vacant) when the burst shows fewer than
+     *  WLC_SETTLE_MIN_EDGES transitions, WLC_STATUS_FLAPPING when it doesn't, or -1 if every
+     *  read was unreadable. Only meaningful while charging is ON — the caller ensures that. */
     private int readSettledWlc() {
-        int stable = -1, agree = 0, reads = 0;
-        boolean sawDisagreement = false;
+        int last = -1, edges = 0, reads = 0;
         for (int i = 0; i < WLC_SETTLE_READS; i++) {
             reads++;
             int v = readWlcStatusUncached();
             if (v >= 0) {
-                if (v == stable) {
-                    if (++agree >= WLC_SETTLE_AGREE) {
-                        Log.d(TAG, "readSettledWlc: settled=" + stable + " after " + reads
-                                + " reads (agree=" + agree + ")");
-                        return stable;
-                    }
-                } else {
-                    if (stable >= 0) sawDisagreement = true; // a real flip, not just the first sample
-                    stable = v;
-                    agree = 1;
-                }
+                if (last >= 0 && v != last) edges++;
+                last = v;
             }
             try {
                 Thread.sleep(WLC_SETTLE_STEP_MS);
@@ -2716,13 +2715,14 @@ public class MdmService extends Service {
                 break;
             }
         }
-        if (sawDisagreement) {
-            Log.w(TAG, "readSettledWlc: FLAPPING after " + reads + " reads (last=" + stable + ")");
-            return WLC_STATUS_FLAPPING; // never reached consensus — line is unstable
+        if (edges >= WLC_SETTLE_MIN_EDGES) {
+            Log.w(TAG, "readSettledWlc: FLAPPING — " + edges + " edges across " + reads
+                    + " reads (~" + (reads * WLC_SETTLE_STEP_MS) + "ms window)");
+            return WLC_STATUS_FLAPPING;
         }
-        Log.d(TAG, "readSettledWlc: best-effort=" + stable + " after " + reads
-                + " reads (no consensus, no disagreement)");
-        return stable; // best effort (may be -1 if every read was unreadable)
+        Log.d(TAG, "readSettledWlc: settled=" + last + " (" + edges + " edge(s) across "
+                + reads + " reads)");
+        return last; // best effort (may be -1 if every read was unreadable)
     }
 
     /** Charging-aware WLC classification (watcher thread only). Returns 1 = guest on pad,
