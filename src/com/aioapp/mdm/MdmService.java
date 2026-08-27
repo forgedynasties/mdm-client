@@ -2598,7 +2598,7 @@ public class MdmService extends Service {
         }
         // Cold path (the watcher hasn't populated the cache yet). Non-pulsing best effort so
         // we never write gpio127 off the watcher thread: charging on -> settled gpio27;
-        // charging off -> last pulsed value (the watcher pulse-refreshes it on its cadence).
+        // charging off -> unknown (the watcher will populate a real reading on its cadence).
         int v = readWlcCharging() ? readSettledWlc() : -1;
         synchronized (wlcLock) {
             cachedWlcStatus = v;
@@ -2610,8 +2610,8 @@ public class MdmService extends Service {
     /** Instantaneous, uncached read of the wireless-charging pad's guest-detection GPIO
      *  (gpio27): 1 = line high, 0 = line low, -1 = unreadable. This is the BARE line; it
      *  only means guest-present(1)/vacant(0) while charging is ON (gpio127=1). With charging
-     *  off the line free-runs and a single sample is meaningless — classifyWlc() handles that
-     *  by pulsing charging on to take a settled read. */
+     *  off the line free-runs and a single sample is meaningless — classifyWlc() reports
+     *  unknown in that case rather than sampling it. */
     private int readWlcStatusUncached() {
         final String gpioPath = "/sys/devices/platform/soc/soc:customer_gpio/gpio27";
         try (java.io.BufferedReader reader = new java.io.BufferedReader(new java.io.FileReader(gpioPath))) {
@@ -2667,18 +2667,26 @@ public class MdmService extends Service {
         if (setWlcCharging(enabled)) wlcLastApplied = Boolean.valueOf(enabled);
     }
 
+    // Reported when charging is ON but gpio27 never settles to WLC_SETTLE_AGREE consecutive
+    // reads — the line is genuinely oscillating (observed in the field on hardware that should
+    // hold steady), not just a single glitchy sample. Distinct from -1 (charging off / unreadable).
+    private static final int WLC_STATUS_FLAPPING = 2;
+
     /** Read gpio27 until WLC_SETTLE_AGREE consecutive reads agree, so a single glitchy
      *  sample (or a mid-placement transition) doesn't flip the reported state. Returns
-     *  1 (guest on pad) / 0 (vacant), or -1 if it never settled / was unreadable. Only
-     *  meaningful while charging is ON — the caller ensures that. */
+     *  1 (guest on pad) / 0 (vacant) on real consensus, WLC_STATUS_FLAPPING if valid reads
+     *  came back but kept disagreeing, or -1 if every read was unreadable. Only meaningful
+     *  while charging is ON — the caller ensures that. */
     private int readSettledWlc() {
         int stable = -1, agree = 0;
+        boolean sawDisagreement = false;
         for (int i = 0; i < WLC_SETTLE_READS; i++) {
             int v = readWlcStatusUncached();
             if (v >= 0) {
                 if (v == stable) {
                     if (++agree >= WLC_SETTLE_AGREE) return stable;
                 } else {
+                    if (stable >= 0) sawDisagreement = true; // a real flip, not just the first sample
                     stable = v;
                     agree = 1;
                 }
@@ -2690,17 +2698,18 @@ public class MdmService extends Service {
                 break;
             }
         }
-        return stable; // best effort (may be -1 if never read cleanly)
+        if (sawDisagreement) return WLC_STATUS_FLAPPING; // never reached consensus — line is unstable
+        return stable; // best effort (may be -1 if every read was unreadable)
     }
 
     /** Charging-aware WLC classification (watcher thread only). Returns 1 = guest on pad,
-     *  0 = vacant, -1 = unknown/not-available. gpio27 is a valid guest-detection line ONLY
-     *  while charging is ON (gpio127=1); with charging OFF it free-runs and is meaningless.
-     *  We deliberately do NOT pulse charging on to read it — that would deliver charge the
-     *  operator disabled — so charging-off reports unknown (-1) and the dashboard shows
-     *  "Not available". Never returns the old "2 = no pad" (undetectable from this line). */
+     *  0 = vacant, WLC_STATUS_FLAPPING = line won't settle, -1 = unknown/not-available.
+     *  gpio27 is a valid guest-detection line ONLY while charging is ON (gpio127=1); with
+     *  charging OFF it free-runs and is meaningless. We deliberately do NOT pulse charging
+     *  on to read it — that would deliver charge the operator disabled — so charging-off
+     *  reports unknown (-1) and the dashboard shows "Not available". */
     private int classifyWlc() {
-        if (readWlcCharging()) {           // gpio127 == 1: the line is stable, trust it
+        if (readWlcCharging()) {           // gpio127 == 1: normally stable, but verify
             return readSettledWlc();
         }
         return -1;                         // charging OFF: line not readable, report unknown
