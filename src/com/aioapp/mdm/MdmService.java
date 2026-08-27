@@ -160,6 +160,19 @@ public class MdmService extends Service {
     private static final long WLC_WATCH_MS = 1_000;
     private volatile int lastWatchedWlc = Integer.MIN_VALUE; // last value the watcher observed
 
+    // Cross-tick flapping detector. readSettledWlc()'s own disagreement check only catches a
+    // pad that won't settle WITHIN one ~160ms sample window — some hardware flaps on a slower
+    // cadence instead, where each individual watcher tick settles cleanly but consecutive
+    // ticks (WLC_WATCH_MS apart) keep disagreeing (observed in the field: settled=0, then
+    // settled=1, then settled=0, one tick apart, agree=3 every time). Tracks the last
+    // WLC_FLAP_WINDOW_TICKS raw 0/1 readings the watcher saw; WLC_FLAP_MIN_FLIPS+ transitions
+    // in that window means the pad is genuinely bouncing tick-to-tick, not settling on a real
+    // placement/removal, so it's reported as flapping instead of whichever value this tick
+    // happened to land on.
+    private static final int WLC_FLAP_WINDOW_TICKS = 5;
+    private static final int WLC_FLAP_MIN_FLIPS = 3;
+    private final java.util.ArrayDeque<Integer> wlcRecentTicks = new java.util.ArrayDeque<>();
+
     // gpio27 only carries guest state while charging is ON (gpio127=1): STABLE 1 = guest
     // on the pad, STABLE 0 = vacant. With charging OFF the line free-runs (toggles rapidly)
     // and carries NO placement info — so to read placement while charging is disabled we
@@ -2725,6 +2738,21 @@ public class MdmService extends Service {
         return -1;                         // charging OFF: line not readable, report unknown
     }
 
+    /** Cross-tick flapping check — see wlcRecentTicks' field comment for why this exists
+     *  alongside readSettledWlc()'s own within-call check. Watcher-thread only (wlcRecentTicks
+     *  is not synchronized). */
+    private boolean tickLooksFlapping(int w) {
+        wlcRecentTicks.addLast(w);
+        while (wlcRecentTicks.size() > WLC_FLAP_WINDOW_TICKS) wlcRecentTicks.removeFirst();
+        int flips = 0;
+        Integer prev = null;
+        for (int v : wlcRecentTicks) {
+            if (prev != null && prev != v) flips++;
+            prev = v;
+        }
+        return flips >= WLC_FLAP_MIN_FLIPS;
+    }
+
     /** Poll the Qi pad's guest-detection GPIO on a short cadence and push telemetry the
      *  instant it changes, so placing/removing a device on the pad is reflected within
      *  ~WLC_WATCH_MS instead of waiting out the telemetry cache + next check-in. Each tick
@@ -2738,6 +2766,16 @@ public class MdmService extends Service {
         wlcWatcher.scheduleWithFixedDelay(() -> {
             try {
                 int w = classifyWlc();
+                if (w == 0 || w == 1) {
+                    if (tickLooksFlapping(w)) {
+                        Log.w(TAG, "WLC watcher: settled=" + w + " but " + WLC_FLAP_MIN_FLIPS
+                                + "+ flips across the last " + wlcRecentTicks.size()
+                                + " ticks — reporting flapping instead");
+                        w = WLC_STATUS_FLAPPING;
+                    }
+                } else {
+                    wlcRecentTicks.clear(); // charging off / call-level flapping / unreadable: no tick trend to track
+                }
                 synchronized (wlcLock) {
                     cachedWlcStatus = w;
                     wlcLastMs = SystemClock.elapsedRealtime();
