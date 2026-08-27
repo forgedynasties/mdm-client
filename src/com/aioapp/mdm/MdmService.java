@@ -2678,13 +2678,18 @@ public class MdmService extends Service {
      *  came back but kept disagreeing, or -1 if every read was unreadable. Only meaningful
      *  while charging is ON — the caller ensures that. */
     private int readSettledWlc() {
-        int stable = -1, agree = 0;
+        int stable = -1, agree = 0, reads = 0;
         boolean sawDisagreement = false;
         for (int i = 0; i < WLC_SETTLE_READS; i++) {
+            reads++;
             int v = readWlcStatusUncached();
             if (v >= 0) {
                 if (v == stable) {
-                    if (++agree >= WLC_SETTLE_AGREE) return stable;
+                    if (++agree >= WLC_SETTLE_AGREE) {
+                        Log.d(TAG, "readSettledWlc: settled=" + stable + " after " + reads
+                                + " reads (agree=" + agree + ")");
+                        return stable;
+                    }
                 } else {
                     if (stable >= 0) sawDisagreement = true; // a real flip, not just the first sample
                     stable = v;
@@ -2698,7 +2703,12 @@ public class MdmService extends Service {
                 break;
             }
         }
-        if (sawDisagreement) return WLC_STATUS_FLAPPING; // never reached consensus — line is unstable
+        if (sawDisagreement) {
+            Log.w(TAG, "readSettledWlc: FLAPPING after " + reads + " reads (last=" + stable + ")");
+            return WLC_STATUS_FLAPPING; // never reached consensus — line is unstable
+        }
+        Log.d(TAG, "readSettledWlc: best-effort=" + stable + " after " + reads
+                + " reads (no consensus, no disagreement)");
         return stable; // best effort (may be -1 if every read was unreadable)
     }
 
