@@ -195,12 +195,44 @@ public class OtaUpdateManager {
                     active = false;
                     currentPhase = "idle";
                     currentPercent = 0;
+                    // A parse/move failure means tempFile itself is suspect (truncated,
+                    // corrupt zip, wrong perms) — purge it so a retry redownloads from
+                    // scratch instead of resuming from the same bad bytes.
+                    purgeCachedPayload();
                     if (listener != null) listener.onError("DOWNLOAD_ERROR");
                 }
             } finally {
                 if (!handedOff) releaseWakeLock();
             }
         });
+    }
+
+    // ----------------------------------------------------------------
+    // Cache invalidation
+    // ----------------------------------------------------------------
+
+    /**
+     * Deletes the cached download and the staged /data/ota_package copy.
+     *
+     * HttpDownloader's resume logic trusts on-disk bytes across separate startUpdate()
+     * calls — it has no way to tell "genuinely still downloading" apart from "silently
+     * corrupted during an earlier attempt" (torn write, a resume that landed on stale
+     * bytes, etc). Once update_engine rejects a payload as corrupt (any non-SUCCESS
+     * errorCode), that on-disk file must not be trusted again: every retry would resume
+     * from the exact same corrupt bytes and fail identically forever, which is exactly
+     * what happened here (FW-2026 device AT070AABU00429, 3 retries all failing on the
+     * same operation/offset with UPDATE_ERROR_29 because update_temp.zip already had the
+     * right byte count and was silently reused instead of redownloaded).
+     */
+    private void purgeCachedPayload() {
+        File tempFile = new File(context.getCacheDir(), TEMP_FILE_NAME);
+        if (tempFile.exists() && !tempFile.delete()) {
+            Log.w(TAG, "purgeCachedPayload: failed to delete " + tempFile);
+        }
+        File finalFile = new File(OTA_PACKAGE_PATH);
+        if (finalFile.exists() && !finalFile.delete()) {
+            Log.w(TAG, "purgeCachedPayload: failed to delete " + finalFile);
+        }
     }
 
     // ----------------------------------------------------------------
@@ -305,6 +337,9 @@ public class OtaUpdateManager {
                 if (errorCode == UpdateEngine.ErrorCodeConstants.SUCCESS) {
                     if (listener != null) listener.onInstallComplete();
                 } else {
+                    // Engine rejected the payload it was just handed — don't let a retry
+                    // resume from the same file. See purgeCachedPayload() for why.
+                    purgeCachedPayload();
                     if (listener != null) listener.onError("UPDATE_ERROR_" + errorCode);
                 }
             }

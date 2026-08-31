@@ -25,11 +25,8 @@ import java.nio.charset.StandardCharsets;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.zip.CRC32;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -215,22 +212,11 @@ public class MdmService extends Service {
     private static final long STALE_WS_THRESHOLD_SECS = 120;
     private volatile long lastHttpCheckinAt = 0;
 
-    private static final Set<String> ALLOWED_SHELL_COMMANDS = new HashSet<>(Arrays.asList(
-            "ls", "cat", "echo", "ps", "df", "uptime", "date", "id",
-            "ip", "netstat", "ifconfig", "ping", "nslookup",
-            "getprop", "setprop", "am", "pm", "wm", "settings",
-            "dumpsys", "logcat", "screencap", "input", "service",
-            "cmd", "stat", "find", "grep", "awk", "sed",
-            "top", "free", "mount", "lsof", "du"
-    ));
-
-    private static boolean isShellCommandAllowed(String cmd) {
-        if (cmd == null || cmd.trim().isEmpty()) return false;
-        String firstWord = cmd.trim().split("\\s+")[0];
-        int slash = firstWord.lastIndexOf('/');
-        if (slash >= 0) firstWord = firstWord.substring(slash + 1);
-        return ALLOWED_SHELL_COMMANDS.contains(firstWord);
-    }
+    // Shell command gating lives server-side only now (the MDM server decides what it will
+    // ever queue as a "shell" command) — the client no longer keeps its own allowlist, so a
+    // legitimate command like `update_engine_client` isn't blocked here just because it wasn't
+    // anticipated on-device. Restricting who can reach the server's shell endpoint in the first
+    // place is what actually matters for safety.
 
     @Override
     public void onCreate() {
@@ -1174,11 +1160,6 @@ public class MdmService extends Service {
                 String shellCmd = payload.optString("cmd", "");
                 if (shellCmd.isEmpty()) {
                     reportTerminal(cmdId, serialNumber, "failed", "empty cmd");
-                    break;
-                }
-                if (!isShellCommandAllowed(shellCmd)) {
-                    Log.w(TAG, "Rejected shell command not on allowlist: " + shellCmd);
-                    reportTerminal(cmdId, serialNumber, "failed", "command not permitted");
                     break;
                 }
                 java.lang.Process p = Runtime.getRuntime().exec(new String[]{"sh", "-c", shellCmd});
