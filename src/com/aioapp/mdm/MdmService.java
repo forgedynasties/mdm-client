@@ -92,9 +92,14 @@ public class MdmService extends Service {
     // Terminal acks not yet CONFIRMED by the server, persisted so a 'completed'/'failed'
     // survives a half-open socket or a process restart. cmdId → ack JSON. Guarded by itself.
     private final java.util.LinkedHashMap<String, JSONObject> pendingAcks = new java.util.LinkedHashMap<>();
+    // Terminal OTA status reports ("installed"/"error") not yet confirmed by the server —
+    // same durability problem as pendingAcks, but postOtaStatus() was fire-and-forget with
+    // no retry at all until this was added. cmdId → status JSON. Guarded by itself.
+    private final java.util.LinkedHashMap<String, JSONObject> pendingOtaAcks = new java.util.LinkedHashMap<>();
     private static final String PREFS_CMD = "mdm_cmd";
     private static final String KEY_DONE_CMDS = "recent_done_commands";
     private static final String KEY_PENDING_ACKS = "pending_acks";
+    private static final String KEY_PENDING_OTA_ACKS = "pending_ota_acks";
     private static final int MAX_DONE_CMDS = 200;
     private volatile boolean cmdStateLoaded = false;
 
@@ -599,7 +604,20 @@ public class MdmService extends Service {
                 }
             } catch (Exception e) { Log.e(TAG, "loadCommandState acks: " + e.getMessage()); }
         }
+        String otaAcks = sp.getString(KEY_PENDING_OTA_ACKS, "");
+        if (!otaAcks.isEmpty()) {
+            try {
+                org.json.JSONArray arr = new org.json.JSONArray(otaAcks);
+                synchronized (pendingOtaAcks) {
+                    for (int i = 0; i < arr.length(); i++) {
+                        JSONObject a = arr.getJSONObject(i);
+                        pendingOtaAcks.put(a.getString("command_id"), a);
+                    }
+                }
+            } catch (Exception e) { Log.e(TAG, "loadCommandState otaAcks: " + e.getMessage()); }
+        }
         drainPendingAcks();
+        drainPendingOtaAcks();
     }
 
     /** Entry point for an incoming WS command: confirm receipt, dedup, then run. */
@@ -688,6 +706,35 @@ public class MdmService extends Service {
                         a.has("package") ? a.optString("package") : null);
                 if (ok) {
                     synchronized (pendingAcks) { pendingAcks.remove(a.optString("command_id")); persistPendingAcks(); }
+                }
+            }
+        });
+    }
+
+    /** persist pendingOtaAcks; caller holds the monitor. */
+    private void persistPendingOtaAcks() {
+        org.json.JSONArray arr = new org.json.JSONArray();
+        for (JSONObject a : pendingOtaAcks.values()) arr.put(a);
+        getSharedPreferences(PREFS_CMD, MODE_PRIVATE).edit()
+                .putString(KEY_PENDING_OTA_ACKS, arr.toString()).apply();
+    }
+
+    /** Deliver every not-yet-confirmed terminal OTA status over HTTP; drop each on a 2xx.
+     *  Mirrors drainPendingAcks — safe to call repeatedly (on reconnect, on report, on
+     *  startup); server acks are idempotent. */
+    private void drainPendingOtaAcks() {
+        executor.submit(() -> {
+            java.util.List<JSONObject> snapshot;
+            synchronized (pendingOtaAcks) {
+                if (pendingOtaAcks.isEmpty()) return;
+                snapshot = new java.util.ArrayList<>(pendingOtaAcks.values());
+            }
+            for (JSONObject a : snapshot) {
+                boolean ok = apiService.postOtaStatusOk(
+                        a.optString("serial_number"), a.optString("command_id"),
+                        a.optString("status"), a.has("error_code") ? a.optString("error_code") : null);
+                if (ok) {
+                    synchronized (pendingOtaAcks) { pendingOtaAcks.remove(a.optString("command_id")); persistPendingOtaAcks(); }
                 }
             }
         });
@@ -815,6 +862,12 @@ public class MdmService extends Service {
         logcatStreams.clear();
     }
 
+    /** Reports a terminal OTA status ("downloaded"/"installed"/"error"). Tries WS first for
+     *  speed, but — unlike the old fire-and-forget version — always also queues a
+     *  persisted, retried HTTP ack (drainPendingOtaAcks), so a report that lands on a dead
+     *  server (WS send "succeeds" into a half-open socket, or the HTTP fallback's single
+     *  attempt fails) isn't lost forever. Confirmed live: a stage outage stranded
+     *  AT070AABU00226/122/387 mid-deployment because the old version had no retry. */
     private void reportOtaStatus(String cmdId, String status, String errorCode) {
         if (wsClient != null && wsClient.isConnected()) {
             try {
@@ -824,12 +877,19 @@ public class MdmService extends Service {
                 m.put("status", status);
                 if (errorCode != null && !errorCode.isEmpty()) m.put("error_code", errorCode);
                 wsClient.send(m.toString());
-                return;
             } catch (Exception e) {
-                Log.e(TAG, "WS ota_status failed, falling back to HTTP: " + e.getMessage());
+                Log.e(TAG, "WS ota_status failed: " + e.getMessage());
             }
         }
-        executor.submit(() -> apiService.postOtaStatus(getDeviceSerial(), cmdId, status, errorCode));
+        try {
+            JSONObject a = new JSONObject();
+            a.put("command_id", cmdId);
+            a.put("serial_number", getDeviceSerial());
+            a.put("status", status);
+            if (errorCode != null && !errorCode.isEmpty()) a.put("error_code", errorCode);
+            synchronized (pendingOtaAcks) { pendingOtaAcks.put(cmdId, a); persistPendingOtaAcks(); }
+        } catch (Exception e) { Log.e(TAG, "reportOtaStatus: " + e.getMessage()); }
+        drainPendingOtaAcks();
     }
 
     /** Relay interim install progress ('downloading' with a percent, or 'installing')
@@ -1100,6 +1160,19 @@ public class MdmService extends Service {
                     // Bound the set so broadcast cancels for commands we never ran
                     // can't accumulate forever.
                     if (cancelledCommands.size() > 128) cancelledCommands.clear();
+                }
+                // OTA: only abort while still downloading — the download's own byte-loop
+                // doesn't consult cancelledCommands (unlike installApkInner), so it needs
+                // an explicit cancel() here. Never touch an install already in progress:
+                // update_engine is mid-write to the inactive slot at that point, and
+                // aborting it risks an unbootable slot rather than just a wasted download.
+                if (!cid.isEmpty() && cid.equals(otaCommandId) && otaUpdateManager != null
+                        && otaUpdateManager.isActive()
+                        && "downloading".equals(otaUpdateManager.getCurrentPhase())) {
+                    Log.i(TAG, "Cancelling in-progress OTA download for command " + cid);
+                    otaUpdateManager.cancel();
+                    reportOtaStatus(cid, "error", "CANCELLED");
+                    otaCommandId = null;
                 }
                 break;
             }

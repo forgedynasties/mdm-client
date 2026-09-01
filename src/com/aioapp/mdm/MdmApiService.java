@@ -180,6 +180,28 @@ public class MdmApiService {
         }
     }
 
+    /** Like postOtaStatus, but returns whether the server accepted it (2xx) so a caller
+     *  can retry a terminal OTA status until it's confirmed — mirrors ackCommandOk.
+     *  A terminal OTA report ("installed"/"error") that's lost to a down server was
+     *  previously fire-and-forget with no retry (FW-2026: stage outage stranded
+     *  AT070AABU00226/122/387 mid-deployment with no way for the server to learn the
+     *  device had actually finished). */
+    public boolean postOtaStatusOk(String serialNumber, String commandId, String status, String errorCode) {
+        try {
+            JSONObject body = new JSONObject();
+            body.put("serial_number", serialNumber);
+            body.put("command_id", commandId);
+            body.put("status", status);
+            if (errorCode != null && !errorCode.isEmpty()) body.put("error_code", errorCode);
+            PostResult result = doPost("/api/v1/ota/status", body.toString());
+            Log.d(TAG, "OTA status(ok) commandId=" + commandId + " status=" + status + " response=" + result.code);
+            return result != null && result.code >= 200 && result.code < 300;
+        } catch (Exception e) {
+            Log.e(TAG, "postOtaStatusOk failed: " + e.getMessage());
+            return false;
+        }
+    }
+
     /**
      * POST /api/v1/ota/progress
      * HTTP fallback for live download/install percent — used when the WS
