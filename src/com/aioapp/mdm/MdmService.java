@@ -853,19 +853,26 @@ public class MdmService extends Service {
         executor.submit(() -> apiService.reportCommandProgress(cmdId, serial, status, percent));
     }
 
-    /** Sends a real-time OTA progress frame over the WebSocket (best-effort). */
+    /** Sends a real-time OTA progress frame over the WebSocket, falling back to HTTP
+     *  when the socket is down or the send fails — WS-only used to mean a flappy
+     *  connection silently dropped every progress report, leaving the dashboard
+     *  percent stuck even though the device was actively downloading the whole time. */
     private void sendOtaProgressFrame(String cmdId, String phase, int percent) {
-        if (cmdId == null || wsClient == null) return;
-        try {
-            JSONObject frame = new JSONObject();
-            frame.put("type", "ota_progress");
-            frame.put("command_id", cmdId);
-            frame.put("phase", phase);
-            frame.put("percent", percent);
-            wsClient.send(frame.toString());
-        } catch (Exception e) {
-            Log.e(TAG, "Failed to send OTA progress frame: " + e.getMessage());
+        if (cmdId == null) return;
+        if (wsClient != null && wsClient.isConnected()) {
+            try {
+                JSONObject frame = new JSONObject();
+                frame.put("type", "ota_progress");
+                frame.put("command_id", cmdId);
+                frame.put("phase", phase);
+                frame.put("percent", percent);
+                wsClient.send(frame.toString());
+                return;
+            } catch (Exception e) {
+                Log.e(TAG, "Failed to send OTA progress frame, falling back to HTTP: " + e.getMessage());
+            }
         }
+        executor.submit(() -> apiService.postOtaProgress(getDeviceSerial(), cmdId, phase, percent));
     }
 
     /** OTA listener that reports against the current otaCommandId, so a duplicate command

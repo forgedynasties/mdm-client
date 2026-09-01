@@ -181,6 +181,28 @@ public class MdmApiService {
     }
 
     /**
+     * POST /api/v1/ota/progress
+     * HTTP fallback for live download/install percent — used when the WS
+     * ota_progress frame can't be sent (socket down or the send itself
+     * throws). Without this a flappy connection just drops every progress
+     * report and the dashboard percent goes stale/blank even though the
+     * device is actively downloading.
+     */
+    public void postOtaProgress(String serialNumber, String commandId, String phase, int percent) {
+        try {
+            JSONObject body = new JSONObject();
+            body.put("serial_number", serialNumber);
+            body.put("command_id", commandId);
+            body.put("phase", phase);
+            body.put("percent", percent);
+            PostResult result = doPost("/api/v1/ota/progress", body.toString());
+            Log.d(TAG, "OTA progress commandId=" + commandId + " phase=" + phase + " percent=" + percent + " response=" + result.code);
+        } catch (Exception e) {
+            Log.e(TAG, "postOtaProgress failed: " + e.getMessage());
+        }
+    }
+
+    /**
      * POST /api/v1/commands/{id}/ack
      * Reports result to the server. status = "installed" | "completed" | "failed"
      * output may be empty, stdout text, or base64-encoded binary.
