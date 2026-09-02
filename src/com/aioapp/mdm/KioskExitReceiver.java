@@ -22,6 +22,7 @@ import android.util.Log;
 public class KioskExitReceiver extends BroadcastReceiver {
     private static final String TAG = "KioskExitReceiver";
     public static final String ACTION = "com.aioapp.mdm.action.KIOSK_EXIT_PROMPT";
+    public static final String PERMISSION = "com.aioapp.mdm.permission.KIOSK_EXIT";
 
     @Override
     public void onReceive(Context context, Intent intent) {

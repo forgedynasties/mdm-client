@@ -379,6 +379,21 @@ public class MdmService extends Service {
         }
     }
 
+    /** True if SystemUI actually holds the KIOSK_EXIT signature permission — i.e. the
+     *  long-press-Back gesture can reach {@link KioskExitReceiver} at all. False (and logged)
+     *  means PackageManager's permission registry is out of sync with the installed APKs;
+     *  no on-device fix exists short of a reinstall/OTA. */
+    private boolean kioskExitGestureWired() {
+        boolean ok = getPackageManager().checkPermission(
+                KioskExitReceiver.PERMISSION, "com.android.systemui") == PackageManager.PERMISSION_GRANTED;
+        if (!ok) {
+            Log.e(TAG, "kiosk-exit gesture broken: SystemUI is not granted "
+                    + KioskExitReceiver.PERMISSION + " (PackageManager permission registry is "
+                    + "stale on this device — reinstall this app and re-flash SystemUI to fix)");
+        }
+        return ok;
+    }
+
     /** True when the device is currently in lock-task (kiosk) mode. */
     private boolean isInKioskLock() {
         try {
@@ -2192,6 +2207,14 @@ public class MdmService extends Service {
         // Actual live kiosk state: true once a technician has exited offline (the device is
         // out of lock-task even though the server's desired config still says kiosk on).
         extra.put("kiosk_suspended", KioskExit.isSuspended(MdmService.this));
+        // Sanity-check the Back+Power exit gesture's plumbing: SystemUI must actually hold the
+        // signature permission that gates the offline-exit broadcast. This can silently drift
+        // out of sync with PackageManager's permission registry on a device (seen in the field:
+        // both this app's declaration and SystemUI's request were present and correct in the
+        // installed APKs, yet PackageManager had no record of the permission at all — a stale
+        // registration that survives reboots and needs a fresh install/OTA to clear). Surfacing
+        // it here turns a multi-hour adb investigation into a one-line dashboard signal.
+        extra.put("kiosk_exit_gesture_ok", kioskExitGestureWired());
         long offlineExitAt = KioskExit.pendingEventAt(MdmService.this);
         if (offlineExitAt > 0) {
             extra.put("offline_exit_at", offlineExitAt);
