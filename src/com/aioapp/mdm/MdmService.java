@@ -6,11 +6,13 @@ import android.app.admin.DevicePolicyManager;
 import android.content.ComponentName;
 import android.content.pm.PackageInstaller;
 import android.content.pm.PackageManager;
+import android.database.ContentObserver;
 import android.net.*;
 import android.net.wifi.*;
 import android.os.*;
 import android.os.Environment;
 import android.os.StatFs;
+import android.provider.Settings;
 import android.util.Log;
 import org.json.JSONArray;
 import org.json.JSONException;
@@ -49,13 +51,21 @@ public class MdmService extends Service {
     private static final String UPDATES_CHANNEL_ID = "AIO_MDM_UPDATES";
     private static final int NOTIFICATION_ID = 1001;
 
-    // Kiosk-exit gesture: SystemUI's long-press-Back arms an exit (via KioskExitReceiver
-    // -> this action); the technician confirms by pressing Power (screen-off) within the
-    // window below. Retires the TOTP prompt without removing the code from the tree.
-    public static final String ACTION_KIOSK_EXIT_ARM = "com.aioapp.mdm.action.KIOSK_EXIT_ARM";
+    // Kiosk-exit gesture: SystemUI's long-press-Back arms an exit by writing this Settings.Secure
+    // key (watched below via ContentObserver); the technician confirms by pressing Power
+    // (screen-off) within the window below. Retires the TOTP prompt without removing the code
+    // from the tree.
+    //
+    // Not a broadcast+signature-permission (what this used to be): that grant is computed when
+    // PackageManager rescans the *requesting* package (SystemUI), and this device's OTA path
+    // doesn't rescan SystemUI for a newly-available permission when SystemUI's own APK is
+    // unchanged — worked on a fresh flash, silently never armed after an OTA. A Settings.Secure
+    // write needs no permission grant between the two apps at all.
+    public static final String KIOSK_EXIT_ARM_SETTING = "aioapp_kiosk_exit_arm_at";
     private static final long KIOSK_EXIT_ARM_WINDOW_MS = 4000;
     private volatile long kioskExitArmedUntilMs = 0;
     private BroadcastReceiver screenOffReceiver;
+    private ContentObserver kioskExitArmObserver;
     // Separate notification for app download/install progress, so it doesn't disturb the
     // persistent foreground-service notification (1001).
     private static final int INSTALL_NOTIFICATION_ID = 1002;
@@ -313,6 +323,17 @@ public class MdmService extends Service {
         };
         registerReceiver(screenOffReceiver, new IntentFilter(Intent.ACTION_SCREEN_OFF));
 
+        // Kiosk-exit arm request from the long-press-Back gesture (SystemUI writes the
+        // Settings.Secure key on every long-press; any write — even the same value — fires
+        // onChange, so no need to inspect the new value here).
+        kioskExitArmObserver = new ContentObserver(new Handler(Looper.getMainLooper())) {
+            @Override public void onChange(boolean selfChange) {
+                armKioskExit();
+            }
+        };
+        getContentResolver().registerContentObserver(
+                Settings.Secure.getUriFor(KIOSK_EXIT_ARM_SETTING), false, kioskExitArmObserver);
+
         alarmManager = getSystemService(AlarmManager.class);
         pollReceiver = new BroadcastReceiver() {
             @Override public void onReceive(Context context, Intent intent) {
@@ -336,11 +357,6 @@ public class MdmService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
-        // Kiosk-exit arm request from the long-press-Back gesture (KioskExitReceiver).
-        if (intent != null && ACTION_KIOSK_EXIT_ARM.equals(intent.getAction())) {
-            armKioskExit();
-            return START_STICKY;
-        }
         // Cancel any existing alarm before rescheduling — prevents duplicates when
         // LOCKED_BOOT_COMPLETED + BOOT_COMPLETED both fire on a fresh boot.
         alarmManager.cancel(pollIntent);
@@ -377,21 +393,6 @@ public class MdmService extends Service {
         } catch (Exception e) {
             Log.e(TAG, "kiosk watchdog error: " + e.getMessage());
         }
-    }
-
-    /** True if SystemUI actually holds the KIOSK_EXIT signature permission — i.e. the
-     *  long-press-Back gesture can reach {@link KioskExitReceiver} at all. False (and logged)
-     *  means PackageManager's permission registry is out of sync with the installed APKs;
-     *  no on-device fix exists short of a reinstall/OTA. */
-    private boolean kioskExitGestureWired() {
-        boolean ok = getPackageManager().checkPermission(
-                KioskExitReceiver.PERMISSION, "com.android.systemui") == PackageManager.PERMISSION_GRANTED;
-        if (!ok) {
-            Log.e(TAG, "kiosk-exit gesture broken: SystemUI is not granted "
-                    + KioskExitReceiver.PERMISSION + " (PackageManager permission registry is "
-                    + "stale on this device — reinstall this app and re-flash SystemUI to fix)");
-        }
-        return ok;
     }
 
     /** True when the device is currently in lock-task (kiosk) mode. */
@@ -2207,14 +2208,6 @@ public class MdmService extends Service {
         // Actual live kiosk state: true once a technician has exited offline (the device is
         // out of lock-task even though the server's desired config still says kiosk on).
         extra.put("kiosk_suspended", KioskExit.isSuspended(MdmService.this));
-        // Sanity-check the Back+Power exit gesture's plumbing: SystemUI must actually hold the
-        // signature permission that gates the offline-exit broadcast. This can silently drift
-        // out of sync with PackageManager's permission registry on a device (seen in the field:
-        // both this app's declaration and SystemUI's request were present and correct in the
-        // installed APKs, yet PackageManager had no record of the permission at all — a stale
-        // registration that survives reboots and needs a fresh install/OTA to clear). Surfacing
-        // it here turns a multi-hour adb investigation into a one-line dashboard signal.
-        extra.put("kiosk_exit_gesture_ok", kioskExitGestureWired());
         long offlineExitAt = KioskExit.pendingEventAt(MdmService.this);
         if (offlineExitAt > 0) {
             extra.put("offline_exit_at", offlineExitAt);
@@ -3034,6 +3027,9 @@ public class MdmService extends Service {
         }
         if (screenOffReceiver != null) {
             try { unregisterReceiver(screenOffReceiver); } catch (Exception ignored) {}
+        }
+        if (kioskExitArmObserver != null) {
+            try { getContentResolver().unregisterContentObserver(kioskExitArmObserver); } catch (Exception ignored) {}
         }
         super.onDestroy();
     }

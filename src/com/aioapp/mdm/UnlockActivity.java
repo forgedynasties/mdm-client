@@ -22,8 +22,9 @@ import android.widget.Toast;
 
 /**
  * The offline kiosk-exit prompt: a technician enters the current rotating code to leave
- * kiosk lock mode with no server connection. Reached only via the nav-bar gesture
- * (long-press Back) → {@link KioskExitReceiver}. Deliberately unbranded.
+ * kiosk lock mode with no server connection. Unused — the nav-bar gesture (long-press Back
+ * + Power) exits directly via {@link MdmService#armKioskExit}, no code entry. Deliberately
+ * unbranded.
  */
 public class UnlockActivity extends Activity {
     private static final String TAG = "UnlockActivity";
