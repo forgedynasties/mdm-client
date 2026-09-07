@@ -1332,6 +1332,16 @@ public class MdmService extends Service {
                 reportTerminal(cmdId, serialNumber, "completed", getInstalledApps().toString());
                 break;
             }
+            case "mic_gain_read": {
+                // Fresh TX_DEC gain snapshot on demand (same shape as the checkin field).
+                // On firmware with the vendor probe daemon, re-probe the mixer first so the
+                // reading is current rather than up to one daemon period old.
+                MicGain.refreshLive(3000);
+                JSONObject mg = MicGain.snapshot();
+                if (mg == null) reportTerminal(cmdId, serialNumber, "failed", "mic gain unavailable: no mixer_paths xml on this device");
+                else reportTerminal(cmdId, serialNumber, "completed", mg.toString());
+                break;
+            }
             case "reboot": {
                 // Server marks reboot commands completed at delivery — no ack needed
                 PowerManager pm = (PowerManager) getSystemService(Context.POWER_SERVICE);
@@ -2201,6 +2211,11 @@ public class MdmService extends Service {
         }
         extra.put("ram_usage_mb", getRamUsageMb());
         extra.put("timezone", java.util.TimeZone.getDefault().getID());
+        // Mic capture gain (TX_DEC0..7 Volume): 102 = trinket mic fix present, 84 = codec
+        // default. Admin-only on the dashboard. Omitted when the device has no mixer-paths
+        // XML (not a trinket audio platform). See MicGain for why this isn't a live read.
+        JSONObject micGain = MicGain.snapshot();
+        if (micGain != null) extra.put("mic_gain", micGain);
         // Offline kiosk-exit: ack that the TOTP seed is provisioned, and surface a pending
         // "exited kiosk offline" event (epoch secs) so the server can audit/alert. The event
         // keeps riding check-ins until the server echoes offline_exit_ack (see applyConfig).
