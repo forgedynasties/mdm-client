@@ -353,6 +353,8 @@ public class MdmService extends Service {
             startWlcWatcher();
             applySavedWlcCharging(); // sysfs resets to on across reboot — restore the saved choice
         }
+        // Mic gain enforcement target (debug prop) resets on boot — restore the saved one.
+        executor.submit(() -> MicGain.applySavedTarget(MdmService.this));
     }
 
     @Override
@@ -1330,6 +1332,23 @@ public class MdmService extends Service {
             }
             case "get_app_inventory": {
                 reportTerminal(cmdId, serialNumber, "completed", getInstalledApps().toString());
+                break;
+            }
+            case "mic_gain_set": {
+                // Admin sets (or clears with value=null/"") the TX_DEC enforcement target.
+                // Only works on firmware with the vendor daemon; reports why otherwise.
+                Integer target = null;
+                if (payload.has("value") && !payload.isNull("value")) {
+                    String v = String.valueOf(payload.opt("value")).trim();
+                    if (!v.isEmpty()) {
+                        try { target = Integer.valueOf(v); }
+                        catch (NumberFormatException e) { reportTerminal(cmdId, serialNumber, "failed", "invalid value: " + v); break; }
+                    }
+                }
+                String err = MicGain.setTarget(MdmService.this, target, 3000);
+                if (err != null) { reportTerminal(cmdId, serialNumber, "failed", err); break; }
+                JSONObject mg = MicGain.snapshot();
+                reportTerminal(cmdId, serialNumber, "completed", mg != null ? mg.toString() : "");
                 break;
             }
             case "mic_gain_read": {

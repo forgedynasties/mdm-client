@@ -53,6 +53,16 @@ public final class MicGain {
     public static final String PROP_LIVE_TS = "vendor.mdm.mic_gain_ts";
     /** init service name of the vendor probe daemon (restart = re-probe now). */
     public static final String PROBE_SERVICE = "vendor.micgain_probe";
+    /**
+     * Enforcement target read by the daemon: an integer makes it write every TX_DECn
+     * Volume to that value before each probe (and re-assert it every loop); empty means
+     * "don't touch". {@code debug.} props are system_public, so system_app may set them
+     * and the vendor daemon may read them, but they do NOT survive a reboot — the saved
+     * target is re-applied from prefs at service start ({@link #applySavedTarget}).
+     */
+    public static final String PROP_TARGET = "debug.mdm.mic_gain.set";
+    private static final String PREFS = "mic_gain";
+    private static final String KEY_TARGET = "target";
 
     /** Mixer-paths files the primary HAL may load, most likely first. */
     private static final String[] MIXER_XMLS = {
@@ -94,7 +104,8 @@ public final class MicGain {
      *  "source":"live"|"config",
      *  "configured":true,          // config: at least one top-level default present
      *  "file":"mixer_paths_idp.xml",
-     *  "ts":1757000000}            // live only: probe epoch seconds
+     *  "ts":1757000000,            // live only: probe epoch seconds
+     *  "target":102}               // live only, when an enforcement target is set
      * </pre>
      */
     public static JSONObject snapshot() {
@@ -146,6 +157,34 @@ public final class MicGain {
         return false;
     }
 
+    /**
+     * Sets (or, with null, clears) the enforcement target and restarts the daemon so it
+     * takes effect now. Persists the choice so it is re-applied after a reboot. Returns
+     * an error string, or null on success. Fails cleanly on firmware without the daemon.
+     */
+    public static String setTarget(android.content.Context ctx, Integer target, long waitMs) {
+        if (target != null && (target < 0 || target > 1000)) return "value out of range: " + target;
+        if (!hasLiveSource()) return "firmware has no micgain_probe daemon; cannot set mic gain";
+        String v = target == null ? "" : String.valueOf(target);
+        if (!SystemPropertiesProxy.set(PROP_TARGET, v)) return "cannot set " + PROP_TARGET;
+        ctx.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE).edit()
+                .putString(KEY_TARGET, v).apply();
+        if (!refreshLive(waitMs)) Log.w(TAG, "setTarget(" + v + "): daemon did not re-probe in time");
+        return null;
+    }
+
+    /** Re-applies the saved enforcement target at service start (debug props reset on boot). */
+    public static void applySavedTarget(android.content.Context ctx) {
+        String v = ctx.getSharedPreferences(PREFS, android.content.Context.MODE_PRIVATE)
+                .getString(KEY_TARGET, "");
+        if (v.isEmpty()) return;
+        if (!hasLiveSource()) { Log.i(TAG, "saved target " + v + " but no daemon on this firmware"); return; }
+        if (SystemPropertiesProxy.set(PROP_TARGET, v)) {
+            Log.i(TAG, "re-applied saved mic gain target " + v);
+            refreshLive(0);
+        }
+    }
+
     /** Live values from the vendor probe daemon, or null when absent/unreadable/errored. */
     private static JSONObject readLive() throws JSONException {
         String raw = SystemPropertiesProxy.get(PROP_LIVE, "").trim();
@@ -171,6 +210,10 @@ public final class MicGain {
         JSONObject o = new JSONObject();
         o.put("tx_dec", arr);
         o.put("source", "live");
+        String target = SystemPropertiesProxy.get(PROP_TARGET, "").trim();
+        if (!target.isEmpty()) {
+            try { o.put("target", Integer.parseInt(target)); } catch (NumberFormatException ignored) {}
+        }
         String ts = SystemPropertiesProxy.get(PROP_LIVE_TS, "").trim();
         if (!ts.isEmpty()) {
             try { o.put("ts", Long.parseLong(ts)); } catch (NumberFormatException ignored) {}
