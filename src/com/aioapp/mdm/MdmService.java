@@ -972,7 +972,9 @@ public class MdmService extends Service {
             }
             @Override public void onError(String errorCode) {
                 // Keep the user-facing text reassuring; the raw code goes to the log + server.
-                updateNotificationIfNeeded("Couldn't finish the update — it'll try again automatically");
+                // Failed updates wait for an operator's Retry on the dashboard; they
+                // are not re-offered on the next check-in any more.
+                updateNotificationIfNeeded("Couldn't finish the update — it can be retried from the dashboard");
                 Log.w(TAG, "OTA error: " + errorCode);
                 reportOtaStatus(otaCommandId, "error", errorCode);
                 otaCommandId = null;
@@ -1191,6 +1193,10 @@ public class MdmService extends Service {
                     otaUpdateManager.cancel();
                     reportOtaStatus(cid, "error", "CANCELLED");
                     otaCommandId = null;
+                    // The status notification was last set by onDownloadProgress
+                    // ("Updating your device… N%"); nothing else resets it after a
+                    // cancel, so the device kept showing a stale percent.
+                    updateNotificationIfNeeded("Your device is set up and protected");
                 }
                 break;
             }
