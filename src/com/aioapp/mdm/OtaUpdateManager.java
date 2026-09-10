@@ -130,6 +130,17 @@ public class OtaUpdateManager {
 
     public void startUpdate(String url) {
         Log.i(TAG, "startUpdate url=" + url);
+        // The cached partial is only worth resuming if it came from this same URL.
+        // A cancelled download of another package left bytes of a different zip in
+        // update_temp.zip; resuming onto them yields a file whose central directory
+        // is right but whose payload region is not, and update_engine rejects it
+        // with UPDATE_ERROR_21 (invalid metadata magic). Seen on AT070AA2600029:
+        // v2.1.3l cancelled at 2%, then v2.0.98d resumed on top of it.
+        if (!url.equals(readCachedUrl())) {
+            Log.i(TAG, "startUpdate: cached payload is for a different URL — purging");
+            purgeCachedPayload();
+            writeCachedUrl(url);
+        }
         currentUrl = url;
 
         // Duplicate guard
@@ -224,7 +235,33 @@ public class OtaUpdateManager {
      * same operation/offset with UPDATE_ERROR_29 because update_temp.zip already had the
      * right byte count and was silently reused instead of redownloaded).
      */
+    private static final String TEMP_URL_FILE_NAME = "update_temp.url";
+
+    /** URL the cached update_temp.zip bytes belong to, or "" when unknown. */
+    private String readCachedUrl() {
+        File f = new File(context.getCacheDir(), TEMP_URL_FILE_NAME);
+        if (!f.exists()) return "";
+        try {
+            return new String(Files.readAllBytes(f.toPath()), java.nio.charset.StandardCharsets.UTF_8).trim();
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    private void writeCachedUrl(String url) {
+        try {
+            Files.write(new File(context.getCacheDir(), TEMP_URL_FILE_NAME).toPath(),
+                    url.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        } catch (Exception e) {
+            Log.w(TAG, "writeCachedUrl: " + e.getMessage());
+        }
+    }
+
     private void purgeCachedPayload() {
+        File urlFile = new File(context.getCacheDir(), TEMP_URL_FILE_NAME);
+        if (urlFile.exists() && !urlFile.delete()) {
+            Log.w(TAG, "purgeCachedPayload: failed to delete " + urlFile);
+        }
         File tempFile = new File(context.getCacheDir(), TEMP_FILE_NAME);
         if (tempFile.exists() && !tempFile.delete()) {
             Log.w(TAG, "purgeCachedPayload: failed to delete " + tempFile);
